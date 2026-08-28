@@ -1,0 +1,24 @@
+{
+  "goal": "完成客户演示方案的最终确认",
+  "summary": "主流程与演示材料已完成，报价口径仍需产品经理确认。",
+  "decisions": [
+    "本次演示只覆盖审批主流程，异常分支放入后续 POC"
+  ],
+  "failed_attempts": [
+    "尝试复用旧报价模板，但字段与本次项目范围不一致"
+  ],
+  "next_step": "联系产品经理确认报价口径，并更新演示方案最后一页",
+  "next_command": "open docs/demo-plan.md",
+  "open_loops": [
+    {
+      "title": "报价口径待确认",
+      "disposition": "park",
+      "note": "明早 09:30 联系产品经理"
+    },
+    {
+      "title": "旧模板兼容性处理",
+      "disposition": "drop",
+      "note": "已决定不再复用旧模板"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offwork-capsule"
+version = "0.2.0"
+description = "A local CLI workbench for tasks, agent sessions, memory, and verified capsules."
+requires-python = ">=3.9"
+
+[project.scripts]
+offwork = "offwork_capsule.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
