@@ -6,6 +6,8 @@ V0.2 只依赖 Python 标准库，默认数据留在本机。它不会替你 com
 
 下一阶段将围绕“跨 Session、跨 Agent 的可信交接”强化交接审计 Receipt、Evidence / Unknowns、Workspace freshness 和显式人工验收。产品 Storyline、状态边界与结构草案见 [可信交接 Storyline 与设计框架](docs/handoff-receipt-design.md)。
 
+原型实现将按 [Handoff Receipt Prototype Implementation Plan](docs/superpowers/plans/2026-08-29-handoff-receipt-prototype.md) 推进，先完成可真实演示的审计闭环，不设置市场验证前置门槛。
+
 ## 直接运行
 
 ```bash
