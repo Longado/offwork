@@ -37,6 +37,23 @@ This four-frame walkthrough comes from one real CLI run against one disposable G
 
 The first two frames preserve the exact difference between an Agent claim and an Offwork-observed check. The third keeps Capsule integrity `passed` while reporting the later workspace change. The fourth binds the human decision, timestamp, and note to the Capsule and Task revision.
 
+## Codex plugin
+
+Install the repository marketplace and plugin:
+
+```bash
+codex plugin marketplace add Longado/offwork --ref main
+codex plugin add offwork-capsule@offwork
+```
+
+Restart Codex, then package the current work with one instruction:
+
+```text
+$offwork capture
+```
+
+Use `$offwork resume <task-id>` to reopen a handoff. The enabled Offwork skill also appears in the slash-command list: type `/` and select **Offwork**.
+
 ## Architecture
 
 Offwork Capsule is organized around a trust flow, not an Agent orchestration loop. Capture collects only the explicit context, authorized checks, and explicit Git project snapshot. Resume rebuilds a Receipt from the published Capsule and compares that evidence with the current workspace.
