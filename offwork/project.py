@@ -100,3 +100,33 @@ def initialize_project(path: str) -> Dict[str, Any]:
     initialize_database(state_dir / "state.sqlite3")
     return metadata
 
+
+def load_project(path: str) -> Dict[str, Any]:
+    project = canonical_project(path)
+    state_dir = project / STATE_DIR_NAME
+    _reject_symlink(state_dir)
+    project_file = state_dir / "project.json"
+    _reject_symlink(project_file)
+    if not state_dir.is_dir() or not project_file.is_file():
+        raise OffworkError(
+            "PROJECT_NOT_INITIALIZED",
+            "Project has not been initialized by Offwork",
+            details={"project_path": str(project)},
+        )
+    try:
+        metadata = json.loads(project_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OffworkError(
+            "INVALID_PROJECT_STATE",
+            "Project metadata is invalid",
+            details={"path": str(project_file)},
+        ) from exc
+    if metadata.get("project_path") != str(project):
+        raise OffworkError(
+            "PROJECT_IDENTITY_MISMATCH",
+            "Offwork state does not match the requested project path",
+            details={"project_path": str(project)},
+        )
+    metadata["path"] = project
+    metadata["state_dir"] = state_dir
+    return metadata
