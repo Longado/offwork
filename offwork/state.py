@@ -316,6 +316,87 @@ class StateService:
             )
         return captured_revision
 
+    def reconcile_capsule(
+        self,
+        *,
+        capsule_id: str,
+        task_id: str,
+        archive_path: str,
+        manifest_hash: str,
+        captured_revision: int,
+        expected_revision: int,
+        expected_current_capsule_id: Optional[str],
+        created_at: str,
+    ) -> int:
+        def is_same_registration(row: sqlite3.Row | None) -> bool:
+            return row is not None and all(
+                (
+                    row["task_id"] == task_id,
+                    row["archive_path"] == archive_path,
+                    row["manifest_hash"] == manifest_hash,
+                    row["captured_task_revision"] == captured_revision,
+                    row["created_at"] == created_at,
+                )
+            )
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM capsules WHERE capsule_id = ?", (capsule_id,)
+            ).fetchone()
+            if is_same_registration(existing):
+                return captured_revision
+            if existing is not None:
+                raise OffworkError(
+                    "CAPSULE_REGISTRATION_CONFLICT",
+                    "Capsule identity is already registered with different state",
+                    details={"task_id": task_id, "capsule_id": capsule_id},
+                )
+
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET revision = ?, current_capsule_id = ?, updated_at = ?
+                WHERE task_id = ? AND revision = ? AND current_capsule_id IS ?
+                """,
+                (
+                    captured_revision,
+                    capsule_id,
+                    created_at,
+                    task_id,
+                    expected_revision,
+                    expected_current_capsule_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                existing = connection.execute(
+                    "SELECT * FROM capsules WHERE capsule_id = ?", (capsule_id,)
+                ).fetchone()
+                if is_same_registration(existing):
+                    return captured_revision
+                raise OffworkError(
+                    "TASK_REVISION_CONFLICT",
+                    "Task changed while a published Capsule was being reconciled",
+                    details={"task_id": task_id, "expected_revision": expected_revision},
+                )
+            connection.execute(
+                """
+                INSERT INTO capsules (
+                    capsule_id, task_id, archive_path, manifest_hash,
+                    captured_task_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    capsule_id,
+                    task_id,
+                    archive_path,
+                    manifest_hash,
+                    captured_revision,
+                    created_at,
+                ),
+            )
+        return captured_revision
+
     def get_capsule(self, task_id: str, capsule_id: Optional[str]) -> Dict[str, Any]:
         task = self.get_task(task_id)
         resolved = capsule_id or task["current_capsule_id"]

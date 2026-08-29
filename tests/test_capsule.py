@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import shlex
 import sqlite3
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from offwork.capsule import _read_private_member
+from offwork.capsule import _read_private_member, reconcile_capsules
 from offwork.cli import main
 from offwork.errors import OffworkError
+from offwork.project import load_project
 from tests.helpers import TempProject
 
 
@@ -354,6 +357,117 @@ class CapsuleIntegrityTests(unittest.TestCase):
             "--project", str(self.temp.project), "--json"
         )
 
+    def capture_another(self, name: str) -> dict:
+        context = dict(CONTEXT)
+        context["summary"] = name
+        context_path = self.temp.write_context(context, f"{name}.json")
+        result = self.temp.run(
+            "capture", "--task", self.task["task_id"], "--context", str(context_path),
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        return self.temp.json_stdout(result)["data"]
+
+    def orphan_capsule(self, capsule_id: str, revision: int, current_capsule_id: str) -> None:
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            connection.execute("DELETE FROM capsules WHERE capsule_id = ?", (capsule_id,))
+            connection.execute(
+                "UPDATE tasks SET revision = ?, current_capsule_id = ? WHERE task_id = ?",
+                (revision, current_capsule_id, self.task["task_id"]),
+            )
+
+    def rewrite_capsule_payload(self, capsule_id: str, change) -> None:
+        directory = self.temp.project / ".offwork" / "capsules" / capsule_id
+        payload_path = directory / "capsule.json"
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        change(payload)
+        self.replace_capsule_payload(capsule_id, payload)
+
+    def replace_capsule_payload(self, capsule_id: str, payload) -> str:
+        directory = self.temp.project / ".offwork" / "capsules" / capsule_id
+        payload_path = directory / "capsule.json"
+        payload_bytes = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode()
+        payload_path.write_bytes(payload_bytes)
+
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"]["capsule.json"] = {
+            "size": len(payload_bytes),
+            "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        }
+        manifest_bytes = (
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode()
+        manifest_path.write_bytes(manifest_bytes)
+        return hashlib.sha256(manifest_bytes).hexdigest()
+
+    def replace_manifest(self, capsule_id: str, manifest) -> str:
+        manifest_path = (
+            self.temp.project / ".offwork" / "capsules" / capsule_id / "manifest.json"
+        )
+        manifest_bytes = (
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode()
+        manifest_path.write_bytes(manifest_bytes)
+        return hashlib.sha256(manifest_bytes).hexdigest()
+
+    def read_manifest(self, capsule_id: str) -> dict:
+        manifest_path = (
+            self.temp.project / ".offwork" / "capsules" / capsule_id / "manifest.json"
+        )
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def register_manifest_hash(self, capsule_id: str, manifest_hash: str) -> None:
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            connection.execute(
+                "UPDATE capsules SET manifest_hash = ? WHERE capsule_id = ?",
+                (manifest_hash, capsule_id),
+            )
+
+    def assert_registered_manifest_integrity_failure(self, manifest) -> None:
+        manifest_hash = self.replace_manifest(self.capsule_id, manifest)
+        self.register_manifest_hash(self.capsule_id, manifest_hash)
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+
+    def assert_orphan_manifest_is_ignored(self, manifest) -> None:
+        second = self.capture_another("malformed manifest orphan")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        self.replace_manifest(second_capsule_id, manifest(second_capsule_id))
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            self.temp.json_stdout(result)["data"]["capsule"]["capsule_id"], self.capsule_id
+        )
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registered = connection.execute(
+                "SELECT COUNT(*) FROM capsules WHERE capsule_id = ?",
+                (second_capsule_id,),
+            ).fetchone()[0]
+        self.assertEqual(task_row, (2, self.capsule_id))
+        self.assertEqual(registered, 0)
+
     def test_manifest_tamper_returns_integrity_failure_and_skips_freshness(self) -> None:
         manifest = self.capsule_dir / "manifest.json"
         manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
@@ -379,6 +493,31 @@ class CapsuleIntegrityTests(unittest.TestCase):
             self.temp.json_stdout(result)["error"]["code"],
             "CAPSULE_INTEGRITY_FAILED",
         )
+
+    def test_hash_consistent_non_object_registered_payload_is_integrity_failure(self) -> None:
+        manifest_hash = self.replace_capsule_payload(self.capsule_id, [])
+        self.register_manifest_hash(self.capsule_id, manifest_hash)
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+
+    def test_hash_consistent_non_object_registered_manifest_is_integrity_failure(self) -> None:
+        self.assert_registered_manifest_integrity_failure([])
+
+    def test_hash_consistent_non_object_registered_manifest_files_is_integrity_failure(self) -> None:
+        manifest = self.read_manifest(self.capsule_id)
+        manifest["files"] = None
+        self.assert_registered_manifest_integrity_failure(manifest)
+
+    def test_hash_consistent_non_object_registered_file_declaration_is_integrity_failure(self) -> None:
+        manifest = self.read_manifest(self.capsule_id)
+        manifest["files"]["capsule.json"] = []
+        self.assert_registered_manifest_integrity_failure(manifest)
 
     def test_symlinked_payload_is_rejected(self) -> None:
         payload = self.capsule_dir / "checks.json"
@@ -454,6 +593,334 @@ class CapsuleIntegrityTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM capsules WHERE capsule_id = ?", (self.capsule_id,)
             ).fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_later_published_capsule_is_reconciled_without_rewriting_history(self) -> None:
+        first_capsule_id = self.capsule_id
+        second = self.capture_another("second capture")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        capsules = self.temp.project / ".offwork" / "capsules"
+        before = {
+            capsule_id: {
+                member.name: (member.read_bytes(), member.stat().st_mtime_ns)
+                for member in (capsules / capsule_id).iterdir()
+            }
+            for capsule_id in (first_capsule_id, second_capsule_id)
+        }
+        self.orphan_capsule(second_capsule_id, 2, first_capsule_id)
+
+        first_read = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+        second_read = self.temp.run(
+            "resume", "--task", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertEqual(first_read.returncode, 0, first_read.stderr or first_read.stdout)
+        self.assertEqual(second_read.returncode, 0, second_read.stderr or second_read.stdout)
+        self.assertEqual(
+            self.temp.json_stdout(first_read)["data"]["capsule"]["capsule_id"],
+            second_capsule_id,
+        )
+        self.assertEqual(
+            self.temp.json_stdout(second_read)["data"]["task"]["current_revision"], 3
+        )
+        historical = self.temp.run(
+            "task", "show", self.task["task_id"], "--capsule", first_capsule_id,
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(historical.returncode, 0, historical.stderr or historical.stdout)
+        after = {
+            capsule_id: {
+                member.name: (member.read_bytes(), member.stat().st_mtime_ns)
+                for member in (capsules / capsule_id).iterdir()
+            }
+            for capsule_id in (first_capsule_id, second_capsule_id)
+        }
+        self.assertEqual(after, before)
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registrations = connection.execute(
+                "SELECT capsule_id, captured_task_revision FROM capsules "
+                "WHERE task_id = ? ORDER BY captured_task_revision",
+                (self.task["task_id"],),
+            ).fetchall()
+        self.assertEqual(task_row, (3, second_capsule_id))
+        self.assertEqual(registrations, [(first_capsule_id, 2), (second_capsule_id, 3)])
+
+    def test_capture_retry_reconciles_existing_orphan_before_publishing_next_revision(self) -> None:
+        first_capsule_id = self.capsule_id
+        orphan = self.capture_another("interrupted capture")
+        orphan_capsule_id = orphan["capsule"]["capsule_id"]
+        self.orphan_capsule(orphan_capsule_id, 2, first_capsule_id)
+
+        retry = self.capture_another("capture retry")
+        retry_capsule_id = retry["capsule"]["capsule_id"]
+
+        self.assertEqual(retry["task"]["captured_revision"], 4)
+        self.assertEqual(retry["task"]["current_revision"], 4)
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registrations = connection.execute(
+                "SELECT capsule_id, captured_task_revision FROM capsules "
+                "WHERE task_id = ? ORDER BY captured_task_revision",
+                (self.task["task_id"],),
+            ).fetchall()
+        self.assertEqual(task_row, (4, retry_capsule_id))
+        self.assertEqual(
+            registrations,
+            [(first_capsule_id, 2), (orphan_capsule_id, 3), (retry_capsule_id, 4)],
+        )
+
+    def test_ambiguous_orphans_block_capture_without_publishing_another_capsule(self) -> None:
+        first_capsule_id = self.capsule_id
+        second = self.capture_another("ambiguous retry one")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        third = self.capture_another("ambiguous retry two")
+        third_capsule_id = third["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, first_capsule_id)
+        self.orphan_capsule(third_capsule_id, 2, first_capsule_id)
+        self.rewrite_capsule_payload(
+            third_capsule_id,
+            lambda payload: payload["task"].update({"captured_revision": 3}),
+        )
+        capsules = self.temp.project / ".offwork" / "capsules"
+        before = sorted(path.name for path in capsules.iterdir())
+        context_path = self.temp.write_context(CONTEXT, "blocked-retry.json")
+
+        result = self.temp.run(
+            "capture", "--task", self.task["task_id"], "--context", str(context_path),
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        error = self.temp.json_stdout(result)["error"]
+        self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_AMBIGUOUS")
+        self.assertEqual(
+            error["details"]["candidate_capsule_ids"],
+            sorted([second_capsule_id, third_capsule_id]),
+        )
+        self.assertEqual(sorted(path.name for path in capsules.iterdir()), before)
+
+    def test_revision_gap_blocks_capture_without_publishing_another_capsule(self) -> None:
+        second = self.capture_another("gap before retry")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        self.rewrite_capsule_payload(
+            second_capsule_id,
+            lambda payload: payload["task"].update({"captured_revision": 4}),
+        )
+        capsules = self.temp.project / ".offwork" / "capsules"
+        before = sorted(path.name for path in capsules.iterdir())
+        context_path = self.temp.write_context(CONTEXT, "gap-blocked-retry.json")
+
+        result = self.temp.run(
+            "capture", "--task", self.task["task_id"], "--context", str(context_path),
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        error = self.temp.json_stdout(result)["error"]
+        self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_GAP")
+        self.assertEqual(error["details"]["candidate_capsule_ids"], [second_capsule_id])
+        self.assertEqual(sorted(path.name for path in capsules.iterdir()), before)
+
+    def test_ambiguous_next_capsules_fail_closed_without_state_change(self) -> None:
+        first_capsule_id = self.capsule_id
+        second = self.capture_another("second candidate")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        third = self.capture_another("other second candidate")
+        third_capsule_id = third["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, first_capsule_id)
+        self.orphan_capsule(third_capsule_id, 2, first_capsule_id)
+        self.rewrite_capsule_payload(
+            third_capsule_id,
+            lambda payload: payload["task"].update({"captured_revision": 3}),
+        )
+
+        results = [
+            self.temp.run(
+                "task", "show", self.task["task_id"],
+                "--project", str(self.temp.project), "--json"
+            )
+            for _ in range(2)
+        ]
+
+        for result in results:
+            self.assertNotEqual(result.returncode, 0)
+            error = self.temp.json_stdout(result)["error"]
+            self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_AMBIGUOUS")
+            self.assertEqual(
+                error["details"]["candidate_capsule_ids"],
+                sorted([second_capsule_id, third_capsule_id]),
+            )
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registrations = connection.execute(
+                "SELECT capsule_id FROM capsules WHERE task_id = ? ORDER BY capsule_id",
+                (self.task["task_id"],),
+            ).fetchall()
+        self.assertEqual(task_row, (2, first_capsule_id))
+        self.assertEqual(registrations, [(first_capsule_id,)])
+
+    def test_concurrent_reconcilers_accept_the_same_winner_idempotently(self) -> None:
+        second = self.capture_another("racing second capture")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        project = load_project(str(self.temp.project))
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+        from offwork import capsule as capsule_module
+
+        real_verify = capsule_module._verify_directory
+
+        def synchronized_verify(directory, capsule_id, expected_manifest_hash):
+            loaded = real_verify(directory, capsule_id, expected_manifest_hash)
+            if capsule_id == second_capsule_id and expected_manifest_hash is None:
+                barrier.wait(timeout=5)
+            return loaded
+
+        def run_reconciler() -> None:
+            try:
+                reconcile_capsules(project, self.task["task_id"])
+            except Exception as exc:  # captured for the main test thread
+                errors.append(exc)
+
+        with mock.patch("offwork.capsule._verify_directory", side_effect=synchronized_verify):
+            threads = [threading.Thread(target=run_reconciler) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        reconcile_capsules(project, self.task["task_id"])
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            count = connection.execute(
+                "SELECT COUNT(*) FROM capsules WHERE capsule_id = ?",
+                (second_capsule_id,),
+            ).fetchone()[0]
+        self.assertEqual(task_row, (3, second_capsule_id))
+        self.assertEqual(count, 1)
+
+    def test_foreign_project_candidate_is_not_reconciled(self) -> None:
+        second = self.capture_another("foreign candidate")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        self.rewrite_capsule_payload(
+            second_capsule_id,
+            lambda payload: payload["observed"].update({"project_id": "project-foreign"}),
+        )
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            self.temp.json_stdout(result)["data"]["capsule"]["capsule_id"], self.capsule_id
+        )
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM capsules WHERE capsule_id = ?", (second_capsule_id,)
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_hash_consistent_non_object_orphan_is_ignored_without_state_change(self) -> None:
+        second = self.capture_another("malformed orphan")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        self.replace_capsule_payload(second_capsule_id, [])
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            self.temp.json_stdout(result)["data"]["capsule"]["capsule_id"], self.capsule_id
+        )
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registrations = connection.execute(
+                "SELECT capsule_id FROM capsules WHERE task_id = ? ORDER BY capsule_id",
+                (self.task["task_id"],),
+            ).fetchall()
+        self.assertEqual(task_row, (2, self.capsule_id))
+        self.assertEqual(registrations, [(self.capsule_id,)])
+
+    def test_hash_consistent_non_object_orphan_manifest_is_ignored(self) -> None:
+        self.assert_orphan_manifest_is_ignored(lambda _capsule_id: [])
+
+    def test_hash_consistent_non_object_orphan_manifest_files_is_ignored(self) -> None:
+        def malformed(capsule_id):
+            manifest = self.read_manifest(capsule_id)
+            manifest["files"] = None
+            return manifest
+
+        self.assert_orphan_manifest_is_ignored(malformed)
+
+    def test_hash_consistent_non_object_orphan_file_declaration_is_ignored(self) -> None:
+        def malformed(capsule_id):
+            manifest = self.read_manifest(capsule_id)
+            manifest["files"]["capsule.json"] = []
+            return manifest
+
+        self.assert_orphan_manifest_is_ignored(malformed)
+
+    def test_skipped_revision_candidate_fails_closed(self) -> None:
+        second = self.capture_another("skipped candidate")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        self.rewrite_capsule_payload(
+            second_capsule_id,
+            lambda payload: payload["task"].update({"captured_revision": 4}),
+        )
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        error = self.temp.json_stdout(result)["error"]
+        self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_GAP")
+        self.assertEqual(error["details"]["candidate_capsule_ids"], [second_capsule_id])
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+        self.assertEqual(task_row, (2, self.capsule_id))
 
 
 if __name__ == "__main__":

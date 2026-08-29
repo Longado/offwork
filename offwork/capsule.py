@@ -125,6 +125,7 @@ def capture(
     project: Dict[str, Any], task_id: str, context_path: str
 ) -> str:
     state = StateService(project["state_dir"])
+    reconcile_capsules(project, task_id)
     task = state.get_task(task_id)
     context = load_context(context_path)
     checks_value = run_checks(task["check_commands"], project["path"])
@@ -255,12 +256,18 @@ def _verify_directory(
         manifest = json.loads(manifest_payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _integrity_error(capsule_id, "Manifest is not valid JSON") from exc
+    if not isinstance(manifest, dict):
+        raise _integrity_error(capsule_id, "Manifest must be a JSON object")
     if (
         manifest.get("schema_version") != "offwork.manifest/v1"
         or manifest.get("capsule_id") != capsule_id
-        or set(manifest.get("files", {})) != set(PAYLOAD_NAMES)
     ):
         raise _integrity_error(capsule_id, "Manifest schema or identity is invalid")
+    manifest_files = manifest.get("files")
+    if not isinstance(manifest_files, dict):
+        raise _integrity_error(capsule_id, "Manifest files must be a JSON object")
+    if set(manifest_files) != set(PAYLOAD_NAMES):
+        raise _integrity_error(capsule_id, "Manifest files do not match the fixed contract")
 
     values: Dict[str, Any] = {}
     expected_schemas = {
@@ -270,13 +277,19 @@ def _verify_directory(
     }
     for name in PAYLOAD_NAMES:
         payload = payload_bytes[name]
-        declared = manifest["files"].get(name, {})
+        declared = manifest_files[name]
+        if not isinstance(declared, dict):
+            raise _integrity_error(
+                capsule_id, f"Manifest declaration for {name} must be a JSON object"
+            )
         if declared.get("size") != len(payload) or declared.get("sha256") != hashlib.sha256(payload).hexdigest():
             raise _integrity_error(capsule_id, f"Capsule member {name} failed verification")
         try:
             value = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise _integrity_error(capsule_id, f"Capsule member {name} is invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise _integrity_error(capsule_id, f"Capsule member {name} must be a JSON object")
         if value.get("schema_version") != expected_schemas[name]:
             raise _integrity_error(capsule_id, f"Capsule member {name} has an unsupported schema")
         values[name] = value
@@ -302,7 +315,12 @@ def load_capsule(
 
 def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
     state = StateService(project["state_dir"])
+    task = state.get_task(task_id)
+    expected_revision = task["revision"]
+    next_revision = expected_revision + 1
     capsules_dir = project["state_dir"] / "capsules"
+    next_candidates: list[Dict[str, Any]] = []
+    skipped_candidates: list[Dict[str, Any]] = []
     for directory in capsules_dir.iterdir():
         capsule_id = directory.name
         if not capsule_id.startswith("capsule-") or state.capsule_registered(capsule_id):
@@ -315,17 +333,67 @@ def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
             continue
         capsule = loaded["capsule"]
         capsule_task = capsule.get("task", {})
-        if capsule_task.get("task_id") != task_id:
+        observed = capsule.get("observed", {})
+        if (
+            not isinstance(capsule_task, dict)
+            or capsule_task.get("task_id") != task_id
+            or not isinstance(observed, dict)
+            or observed.get("project_id") != project["project_id"]
+            or observed.get("project_path") != project["project_path"]
+            or not isinstance(capsule.get("captured_at"), str)
+            or not capsule["captured_at"]
+        ):
             continue
-        task = state.get_task(task_id)
         captured_revision = capsule_task.get("captured_revision")
-        if task["revision"] + 1 != captured_revision or task["current_capsule_id"] is not None:
+        if not isinstance(captured_revision, int) or isinstance(captured_revision, bool):
             continue
-        state.register_capsule(
-            capsule_id=capsule_id,
-            task_id=task_id,
-            archive_path=archive_path,
-            manifest_hash=loaded["manifest_hash"],
-            expected_revision=task["revision"],
-            created_at=capsule["captured_at"],
+        candidate = {
+            "capsule_id": capsule_id,
+            "archive_path": archive_path,
+            "manifest_hash": loaded["manifest_hash"],
+            "captured_revision": captured_revision,
+            "created_at": capsule["captured_at"],
+        }
+        if captured_revision == next_revision:
+            next_candidates.append(candidate)
+        elif captured_revision > next_revision:
+            skipped_candidates.append(candidate)
+
+    if skipped_candidates:
+        raise OffworkError(
+            "CAPSULE_RECONCILIATION_GAP",
+            "Published Capsules skip the Task's next revision",
+            details={
+                "task_id": task_id,
+                "expected_captured_revision": next_revision,
+                "candidate_capsule_ids": sorted(
+                    candidate["capsule_id"] for candidate in skipped_candidates
+                ),
+            },
         )
+    if len(next_candidates) > 1:
+        raise OffworkError(
+            "CAPSULE_RECONCILIATION_AMBIGUOUS",
+            "Multiple published Capsules claim the Task's next revision",
+            details={
+                "task_id": task_id,
+                "expected_captured_revision": next_revision,
+                "candidate_capsule_ids": sorted(
+                    candidate["capsule_id"] for candidate in next_candidates
+                ),
+            },
+        )
+    if not next_candidates:
+        return
+
+    candidate = next_candidates[0]
+    state.reconcile_capsule(
+        capsule_id=candidate["capsule_id"],
+        task_id=task_id,
+        archive_path=candidate["archive_path"],
+        manifest_hash=candidate["manifest_hash"],
+        captured_revision=candidate["captured_revision"],
+        expected_revision=expected_revision,
+        expected_current_capsule_id=task["current_capsule_id"],
+        created_at=candidate["created_at"],
+    )
