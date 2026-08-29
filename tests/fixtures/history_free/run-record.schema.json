@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "offwork.history-free-run/v1",
+  "title": "Offwork real history-free Agent run record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "case_id",
+    "agent",
+    "commands",
+    "overall_elapsed_ms",
+    "response",
+    "result",
+    "note"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "offwork.history-free-run/v1"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "not_run",
+        "completed",
+        "failed"
+      ]
+    },
+    "case_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "purpose",
+          "argv",
+          "elapsed_ms",
+          "exit_code"
+        ],
+        "properties": {
+          "purpose": {
+            "type": "string",
+            "minLength": 1
+          },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "overall_elapsed_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "response": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "result": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "note": {
+      "type": "string"
+    }
+  }
+}

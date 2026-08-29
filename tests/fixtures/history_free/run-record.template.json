@@ -1,0 +1,11 @@
+{
+  "schema_version": "offwork.history-free-run/v1",
+  "status": "not_run",
+  "case_id": null,
+  "agent": null,
+  "commands": [],
+  "overall_elapsed_ms": null,
+  "response": null,
+  "result": null,
+  "note": "Template only. Populate commands, elapsed fields, response, and result after a real fresh-Agent run."
+}

@@ -1,0 +1,166 @@
+{
+  "schema_version": "offwork.history-free-cases/v1",
+  "purpose": "Deterministic fixture construction only; these expected decisions are not Agent run results.",
+  "cases": [
+    {
+      "case_id": "continue",
+      "task": {
+        "title": "Continue the verified local change",
+        "goal": "Begin the captured next step from a fresh trusted workspace"
+      },
+      "check_script": "from pathlib import Path; assert Path('tracked.txt').read_text(encoding='utf-8') == 'captured\\n'",
+      "context": {
+        "summary": "The local implementation is ready for its captured next step.",
+        "agent_claims": [
+          "The tracked baseline is ready to continue."
+        ],
+        "unknowns": [],
+        "open_loops": [],
+        "next_step": "Add the approved assertion to tracked.txt."
+      },
+      "after_capture": {
+        "kind": "none"
+      },
+      "expected": {
+        "decision": "continue",
+        "next_step_evidence": "Add the approved assertion to tracked.txt.",
+        "required_citations": [
+          {
+            "receipt_path": "$.data.handoff_verified.integrity.status",
+            "value": "passed"
+          },
+          {
+            "receipt_path": "$.data.handoff_verified.restore.status",
+            "value": "passed"
+          },
+          {
+            "receipt_path": "$.data.workspace_freshness.status",
+            "value": "fresh"
+          },
+          {
+            "receipt_path": "$.data.auto_checked.status",
+            "value": "passed"
+          },
+          {
+            "receipt_path": "$.data.unknowns",
+            "value": []
+          },
+          {
+            "receipt_path": "$.data.open_loops",
+            "value": []
+          },
+          {
+            "receipt_path": "$.data.next_step",
+            "value": "Add the approved assertion to tracked.txt."
+          }
+        ],
+        "proposed_first_action": {
+          "mode": "project_action",
+          "value": "Add the approved assertion to tracked.txt."
+        }
+      }
+    },
+    {
+      "case_id": "verify",
+      "task": {
+        "title": "Verify changed migration work",
+        "goal": "Review workspace drift before changing the project again"
+      },
+      "check_script": "from pathlib import Path; assert Path('tracked.txt').read_text(encoding='utf-8') == 'captured\\n'",
+      "context": {
+        "summary": "The captured baseline passed its automatic check, but migration evidence remains open.",
+        "agent_claims": [
+          "The captured baseline passed its configured check."
+        ],
+        "unknowns": [
+          "The changed tracked.txt has not been reviewed against the captured baseline."
+        ],
+        "open_loops": [
+          {
+            "title": "Review the post-capture tracked.txt change",
+            "disposition": "resolve",
+            "note": "Inspect the exact diff before modifying any project file."
+          }
+        ],
+        "next_step": "Review the diff for tracked.txt before modifying any project file."
+      },
+      "after_capture": {
+        "kind": "write_text",
+        "path": "tracked.txt",
+        "content": "changed after capture\\n"
+      },
+      "expected": {
+        "decision": "verify",
+        "material_unknown": "The changed tracked.txt has not been reviewed against the captured baseline.",
+        "next_step_evidence": "Review the diff for tracked.txt before modifying any project file.",
+        "required_citations": [
+          {
+            "receipt_path": "$.data.handoff_verified.integrity.status",
+            "value": "passed"
+          },
+          {
+            "receipt_path": "$.data.workspace_freshness.status",
+            "value": "changed"
+          },
+          {
+            "receipt_path": "$.data.unknowns",
+            "value": [
+              "The changed tracked.txt has not been reviewed against the captured baseline."
+            ]
+          },
+          {
+            "receipt_path": "$.data.next_step",
+            "value": "Review the diff for tracked.txt before modifying any project file."
+          }
+        ],
+        "proposed_first_action": {
+          "mode": "verification",
+          "value": "Review the diff for tracked.txt before modifying any project file."
+        }
+      }
+    },
+    {
+      "case_id": "stop",
+      "task": {
+        "title": "Stop on an untrusted Capsule",
+        "goal": "Avoid project action when the handoff integrity boundary fails"
+      },
+      "check_script": "from pathlib import Path; assert Path('tracked.txt').read_text(encoding='utf-8') == 'captured\\n'",
+      "context": {
+        "summary": "The captured task had a proposed project action before its Capsule was corrupted.",
+        "agent_claims": [
+          "The captured baseline was ready for the proposed action."
+        ],
+        "unknowns": [],
+        "open_loops": [],
+        "next_step": "Modify tracked.txt."
+      },
+      "after_capture": {
+        "kind": "tamper_manifest",
+        "append": " "
+      },
+      "expected": {
+        "decision": "stop",
+        "integrity_error": "CAPSULE_INTEGRITY_FAILED",
+        "required_citations": [
+          {
+            "receipt_path": "$.error.code",
+            "value": "CAPSULE_INTEGRITY_FAILED"
+          },
+          {
+            "receipt_path": "$.error.details.integrity",
+            "value": "failed"
+          },
+          {
+            "receipt_path": "$.error.details.freshness",
+            "value": "not_evaluated"
+          }
+        ],
+        "proposed_first_action": {
+          "mode": "none",
+          "value": null
+        }
+      }
+    }
+  ]
+}
