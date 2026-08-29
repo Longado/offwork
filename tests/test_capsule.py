@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import shlex
+import sqlite3
 import sys
 import unittest
+from pathlib import Path
 
 from tests.helpers import TempProject
 
@@ -202,6 +204,109 @@ class CheckRunnerTests(unittest.TestCase):
 
         self.assertEqual(receipt["auto_checked"]["status"], "passed")
         self.assertEqual(receipt["workspace_freshness"]["status"], "fresh")
+
+
+class CapsuleIntegrityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TempProject()
+        self.temp.init_git()
+        self.temp.init()
+        self.task = self.temp.add_task()
+        context = self.temp.write_context(CONTEXT)
+        result = self.temp.run(
+            "capture", "--task", self.task["task_id"], "--context", str(context),
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.receipt = self.temp.json_stdout(result)["data"]
+        self.capsule_id = self.receipt["capsule"]["capsule_id"]
+        self.capsule_dir = self.temp.project / ".offwork" / "capsules" / self.capsule_id
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def show(self):
+        return self.temp.run(
+            "task", "show", self.task["task_id"], "--capsule", self.capsule_id,
+            "--project", str(self.temp.project), "--json"
+        )
+
+    def test_manifest_tamper_returns_integrity_failure_and_skips_freshness(self) -> None:
+        manifest = self.capsule_dir / "manifest.json"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        envelope = self.temp.json_stdout(result)
+        self.assertEqual(envelope["error"]["code"], "CAPSULE_INTEGRITY_FAILED")
+        self.assertEqual(envelope["error"]["details"]["integrity"], "failed")
+        self.assertEqual(envelope["error"]["details"]["freshness"], "not_evaluated")
+
+    def test_payload_tamper_returns_integrity_failure(self) -> None:
+        payload = self.capsule_dir / "capsule.json"
+        value = json.loads(payload.read_text(encoding="utf-8"))
+        value["context"]["summary"] = "tampered"
+        payload.write_text(json.dumps(value), encoding="utf-8")
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+
+    def test_symlinked_payload_is_rejected(self) -> None:
+        payload = self.capsule_dir / "checks.json"
+        outside = self.temp.root / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        payload.unlink()
+        payload.symlink_to(outside)
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+
+    def test_unknown_capsule_member_is_rejected(self) -> None:
+        (self.capsule_dir / "extra.txt").write_text("unexpected", encoding="utf-8")
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+
+    def test_valid_orphan_capsule_is_reconciled_idempotently(self) -> None:
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            connection.execute("DELETE FROM capsules WHERE capsule_id = ?", (self.capsule_id,))
+            connection.execute(
+                "UPDATE tasks SET revision = 1, current_capsule_id = NULL WHERE task_id = ?",
+                (self.task["task_id"],),
+            )
+
+        first = self.temp.run(
+            "task", "show", self.task["task_id"], "--project", str(self.temp.project), "--json"
+        )
+        second = self.temp.run(
+            "task", "show", self.task["task_id"], "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+        self.assertEqual(second.returncode, 0, second.stderr or second.stdout)
+        self.assertEqual(self.temp.json_stdout(first)["data"]["capsule"]["capsule_id"], self.capsule_id)
+        with sqlite3.connect(str(database)) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM capsules WHERE capsule_id = ?", (self.capsule_id,)
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
 
 
 if __name__ == "__main__":

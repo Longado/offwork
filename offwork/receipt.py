@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from offwork.capsule import load_capsule
+from offwork.capsule import load_capsule, reconcile_capsules
 from offwork.project import capture_workspace, compare_workspace
 from offwork.state import StateService, utc_now
 
@@ -10,10 +10,16 @@ from offwork.state import StateService, utc_now
 def build_receipt(
     project: Dict[str, Any], task_id: str, capsule_id: Optional[str] = None
 ) -> Dict[str, Any]:
+    reconcile_capsules(project, task_id)
     state = StateService(project["state_dir"])
     task = state.get_task(task_id)
     capsule_row = state.get_capsule(task_id, capsule_id)
-    loaded = load_capsule(project["state_dir"], capsule_row["archive_path"])
+    loaded = load_capsule(
+        project["state_dir"],
+        capsule_row["archive_path"],
+        capsule_row["capsule_id"],
+        capsule_row["manifest_hash"],
+    )
     capsule = loaded["capsule"]
     context = capsule["context"]
     comparison = compare_workspace(capsule["workspace_snapshot"], capture_workspace(project))

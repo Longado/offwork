@@ -176,3 +176,10 @@ class StateService:
                 details={"task_id": task_id, "capsule_id": resolved},
             )
         return dict(row)
+
+    def capsule_registered(self, capsule_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM capsules WHERE capsule_id = ?", (capsule_id,)
+            ).fetchone()
+        return row is not None

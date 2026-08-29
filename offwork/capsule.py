@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import uuid
 from pathlib import Path
 from typing import Any, Dict
@@ -15,6 +16,7 @@ from offwork.state import StateService, utc_now
 
 
 PAYLOAD_NAMES = ("capsule.json", "checks.json", "restore-test.json")
+CAPSULE_MEMBERS = frozenset((*PAYLOAD_NAMES, "manifest.json"))
 
 
 def _json_bytes(value: Dict[str, Any]) -> bytes:
@@ -28,6 +30,26 @@ def _write_private(path: Path, payload: bytes) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _integrity_error(capsule_id: str, message: str) -> OffworkError:
+    return OffworkError(
+        "CAPSULE_INTEGRITY_FAILED",
+        message,
+        details={
+            "capsule_id": capsule_id,
+            "integrity": "failed",
+            "freshness": "not_evaluated",
+        },
+    )
 
 
 def load_context(path: str) -> Dict[str, Any]:
@@ -119,7 +141,9 @@ def capture(
         for name, payload in payloads.items():
             _write_private(staging / name, payload)
         _write_private(staging / "manifest.json", manifest_payload)
+        _fsync_directory(staging)
         os.rename(staging, final)
+        _fsync_directory(capsules_dir)
     except Exception:
         if staging.exists():
             shutil.rmtree(staging)
@@ -136,22 +160,123 @@ def capture(
     return capsule_id
 
 
-def load_capsule(state_dir: Path, archive_path: str) -> Dict[str, Any]:
-    directory = state_dir / archive_path
+def _validated_archive_path(state_dir: Path, archive_path: str, capsule_id: str) -> Path:
+    relative = Path(archive_path)
+    if relative.is_absolute() or relative.parts != ("capsules", capsule_id):
+        raise _integrity_error(capsule_id, "Capsule archive path is invalid")
+    directory = state_dir / relative
     try:
-        capsule_value = json.loads((directory / "capsule.json").read_text(encoding="utf-8"))
-        checks_value = json.loads((directory / "checks.json").read_text(encoding="utf-8"))
-        restore_value = json.loads(
-            (directory / "restore-test.json").read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError) as exc:
-        raise OffworkError(
-            "CAPSULE_LOAD_FAILED",
-            "Published Capsule could not be reloaded",
-            details={"archive_path": archive_path},
-        ) from exc
-    return {
-        "capsule": capsule_value,
-        "checks": checks_value,
-        "restore": restore_value,
+        directory_mode = directory.lstat().st_mode
+    except OSError as exc:
+        raise _integrity_error(capsule_id, "Capsule directory is missing") from exc
+    if not stat.S_ISDIR(directory_mode) or stat.S_ISLNK(directory_mode):
+        raise _integrity_error(capsule_id, "Capsule directory must be a real directory")
+    return directory
+
+
+def _verify_directory(
+    directory: Path, capsule_id: str, expected_manifest_hash: str | None
+) -> Dict[str, Any]:
+    try:
+        members = {entry.name for entry in directory.iterdir()}
+    except OSError as exc:
+        raise _integrity_error(capsule_id, "Capsule directory cannot be read") from exc
+    if members != CAPSULE_MEMBERS:
+        raise _integrity_error(capsule_id, "Capsule members do not match the fixed contract")
+
+    payload_bytes: Dict[str, bytes] = {}
+    for name in CAPSULE_MEMBERS:
+        path = directory / name
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise _integrity_error(capsule_id, f"Capsule member {name} is missing") from exc
+        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            raise _integrity_error(capsule_id, f"Capsule member {name} is not a regular file")
+        try:
+            payload_bytes[name] = path.read_bytes()
+        except OSError as exc:
+            raise _integrity_error(capsule_id, f"Capsule member {name} cannot be read") from exc
+
+    manifest_payload = payload_bytes["manifest.json"]
+    manifest_hash = hashlib.sha256(manifest_payload).hexdigest()
+    if expected_manifest_hash is not None and manifest_hash != expected_manifest_hash:
+        raise _integrity_error(capsule_id, "Manifest hash does not match registered state")
+    try:
+        manifest = json.loads(manifest_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _integrity_error(capsule_id, "Manifest is not valid JSON") from exc
+    if (
+        manifest.get("schema_version") != "offwork.manifest/v1"
+        or manifest.get("capsule_id") != capsule_id
+        or set(manifest.get("files", {})) != set(PAYLOAD_NAMES)
+    ):
+        raise _integrity_error(capsule_id, "Manifest schema or identity is invalid")
+
+    values: Dict[str, Any] = {}
+    expected_schemas = {
+        "capsule.json": "offwork.capsule/v1",
+        "checks.json": "offwork.checks/v1",
+        "restore-test.json": "offwork.restore-test/v1",
     }
+    for name in PAYLOAD_NAMES:
+        payload = payload_bytes[name]
+        declared = manifest["files"].get(name, {})
+        if declared.get("size") != len(payload) or declared.get("sha256") != hashlib.sha256(payload).hexdigest():
+            raise _integrity_error(capsule_id, f"Capsule member {name} failed verification")
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _integrity_error(capsule_id, f"Capsule member {name} is invalid JSON") from exc
+        if value.get("schema_version") != expected_schemas[name]:
+            raise _integrity_error(capsule_id, f"Capsule member {name} has an unsupported schema")
+        values[name] = value
+    if values["capsule.json"].get("capsule_id") != capsule_id:
+        raise _integrity_error(capsule_id, "Capsule payload identity does not match its directory")
+    return {
+        "capsule": values["capsule.json"],
+        "checks": values["checks.json"],
+        "restore": values["restore-test.json"],
+        "manifest_hash": manifest_hash,
+    }
+
+
+def load_capsule(
+    state_dir: Path,
+    archive_path: str,
+    capsule_id: str,
+    expected_manifest_hash: str,
+) -> Dict[str, Any]:
+    directory = _validated_archive_path(state_dir, archive_path, capsule_id)
+    return _verify_directory(directory, capsule_id, expected_manifest_hash)
+
+
+def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
+    state = StateService(project["state_dir"])
+    capsules_dir = project["state_dir"] / "capsules"
+    for directory in capsules_dir.iterdir():
+        capsule_id = directory.name
+        if not capsule_id.startswith("capsule-") or state.capsule_registered(capsule_id):
+            continue
+        archive_path = f"capsules/{capsule_id}"
+        try:
+            validated = _validated_archive_path(project["state_dir"], archive_path, capsule_id)
+            loaded = _verify_directory(validated, capsule_id, None)
+        except OffworkError:
+            continue
+        capsule = loaded["capsule"]
+        capsule_task = capsule.get("task", {})
+        if capsule_task.get("task_id") != task_id:
+            continue
+        task = state.get_task(task_id)
+        captured_revision = capsule_task.get("captured_revision")
+        if task["revision"] + 1 != captured_revision or task["current_capsule_id"] is not None:
+            continue
+        state.register_capsule(
+            capsule_id=capsule_id,
+            task_id=task_id,
+            archive_path=archive_path,
+            manifest_hash=loaded["manifest_hash"],
+            expected_revision=task["revision"],
+            created_at=capsule["captured_at"],
+        )
