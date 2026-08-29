@@ -13,11 +13,11 @@ This file keeps the human product decision visible throughout development. It is
 
 ## Current checkpoint
 
-- Milestone: Prototype audit remediation before merge
-- Human PM reviewer: user or a human delegate explicitly named by the user
+- Milestone: Loop 1 — Trust boundary implementation
+- Human PM reviewer: user
 - Status: `pending`
 - Opened: 2026-08-29
-- Decision requested: approve, reject, or change the loop sequence in `EVOLUTION_PLAN.md`; approval of Loop 1 authorizes only the P1 trust-boundary remediation before another review
+- Decision requested: after Loop 1 implementation and review evidence are available, accept, reject, or request changes before Loop 2 begins
 
 ### Evidence prepared for review
 
@@ -49,4 +49,9 @@ To be completed only after an explicit human decision:
 
 ## Review history
 
-No completed human PM decision has been recorded yet.
+### 2026-08-29 — Evolution plan and Loop 1 authorization
+
+- Reviewer: user
+- Status: `accepted`
+- Decision: The loop sequence in `EVOLUTION_PLAN.md` is approved, and Loop 1 trust-boundary implementation is authorized.
+- Boundary: This decision does not approve Loop 1 completion, Loop 2, merge, tag, or release. Those require later explicit human PM decisions.
