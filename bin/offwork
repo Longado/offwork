@@ -1,6 +1,0 @@
-#!/bin/sh
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECT_DIR=$(dirname -- "$SCRIPT_DIR")
-PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m offwork_capsule.cli "$@"
-
