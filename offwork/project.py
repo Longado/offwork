@@ -75,7 +75,12 @@ def _write_private_json(path: Path, value: Dict[str, Any]) -> None:
         ) from exc
     try:
         os.fchmod(descriptor, PRIVATE_FILE_MODE)
-        os.write(descriptor, payload)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("project metadata write made no progress")
+            remaining = remaining[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

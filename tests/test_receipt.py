@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -13,10 +14,12 @@ from copy import deepcopy
 from unittest import mock
 
 from offwork import capsule as capsule_module
+from offwork import state as state_module
 from offwork.capsule import capture
 from offwork.cli import main
 from offwork.output import render_receipt
 from offwork.project import load_project
+from offwork.receipt import build_receipt
 from offwork.state import StateService
 from tests.helpers import TempProject
 from tests.test_capsule import CONTEXT
@@ -241,6 +244,113 @@ class ReceiptTests(unittest.TestCase):
         self.assertIn("- Captured changes: none", human)
         self.assertIn("Unknowns:\n- none", human)
         self.assertIn("Open loops:\n- none", human)
+
+    def test_receipt_state_is_one_sqlite_snapshot_during_acceptance_interleaving(self) -> None:
+        captured = self.capture(CONTEXT, "snapshot.json")
+        capsule_id = captured["capsule"]["capsule_id"]
+        task_id = self.task["task_id"]
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        connection = sqlite3.connect(str(database))
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+        finally:
+            connection.close()
+        for suffix in ("-wal", "-shm"):
+            auxiliary = database.parent / f"{database.name}{suffix}"
+            if auxiliary.exists():
+                os.chmod(auxiliary, 0o600)
+
+        real_connect = state_module.connect
+        connections_opened = 0
+        interleaved = False
+
+        class InterleavingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            @property
+            def row_factory(self):
+                return self.connection.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value):
+                self.connection.row_factory = value
+
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+
+            def __exit__(self, *arguments):
+                try:
+                    return self.connection.__exit__(*arguments)
+                finally:
+                    self.connection.close()
+
+            def execute(self, sql, parameters=()):
+                nonlocal interleaved
+                cursor = self.connection.execute(sql, parameters)
+                if not interleaved and "SELECT * FROM tasks" in sql:
+                    interleaved = True
+                    writer = sqlite3.connect(str(database))
+                    try:
+                        writer.execute(
+                            "UPDATE tasks SET revision = 3 WHERE task_id = ?",
+                            (task_id,),
+                        )
+                        writer.execute(
+                            """
+                            INSERT INTO human_acceptance_events (
+                                event_id, capsule_id, status, note,
+                                task_revision, created_at
+                            ) VALUES (?, ?, 'accepted', NULL, 3, ?)
+                            """,
+                            (
+                                "acceptance-interleaved",
+                                capsule_id,
+                                "2026-08-29T00:00:00+00:00",
+                            ),
+                        )
+                        writer.commit()
+                    finally:
+                        writer.close()
+                    for suffix in ("-wal", "-shm"):
+                        auxiliary = database.parent / f"{database.name}{suffix}"
+                        if auxiliary.exists():
+                            os.chmod(auxiliary, 0o600)
+                return cursor
+
+        def connect_with_interleaving(path):
+            nonlocal connections_opened
+            connections_opened += 1
+            return InterleavingConnection(real_connect(path))
+
+        project = load_project(str(self.temp.project))
+        with mock.patch("offwork.state.connect", side_effect=connect_with_interleaving):
+            receipt = build_receipt(
+                project,
+                self.task["task_id"],
+                reconcile_orphans=False,
+            )
+
+        self.assertTrue(interleaved)
+        self.assertEqual(receipt["task"]["current_revision"], 2)
+        self.assertEqual(receipt["capsule"]["capsule_id"], capsule_id)
+        self.assertEqual(receipt["human_acceptance"]["status"], "pending")
+        self.assertEqual(connections_opened, 1)
+
+        connection = sqlite3.connect(str(database))
+        try:
+            stored_revision = connection.execute(
+                "SELECT revision FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            stored_acceptance = connection.execute(
+                "SELECT status FROM human_acceptance_events WHERE capsule_id = ?",
+                (capsule_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(stored_revision, 3)
+        self.assertEqual(stored_acceptance, "accepted")
 
 
 class FreshnessTests(unittest.TestCase):

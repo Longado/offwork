@@ -17,8 +17,9 @@ def build_receipt(
     if reconcile_orphans:
         reconcile_capsules(project, task_id)
     state = StateService(project["state_dir"])
-    task = state.get_task(task_id)
-    capsule_row = state.get_capsule(task_id, capsule_id)
+    receipt_state = state.get_receipt_state(task_id, capsule_id)
+    task = receipt_state["task"]
+    capsule_row = receipt_state["capsule"]
     loaded = load_capsule(
         project["state_dir"],
         capsule_row["archive_path"],
@@ -63,5 +64,5 @@ def build_receipt(
             "changes": comparison["changes"],
             "limitations": comparison["limitations"],
         },
-        "human_acceptance": state.get_acceptance(capsule["capsule_id"]),
+        "human_acceptance": receipt_state["acceptance"],
     }

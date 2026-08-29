@@ -8,7 +8,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from offwork.project import capture_workspace, load_project
+from offwork.project import _write_private_json, capture_workspace, load_project
 from tests.helpers import TempProject
 
 
@@ -33,6 +33,67 @@ class ProjectInitializationTests(unittest.TestCase):
         self.assertEqual(metadata["schema_version"], "offwork.project/v1")
         self.assertEqual(metadata["project_path"], str(self.temp.project.resolve()))
         self.assertRegex(metadata["project_id"], r"^project-[0-9a-f]{32}$")
+
+        connection = sqlite3.connect(str(state_dir / "state.sqlite3"))
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(version, 3)
+
+    def test_init_rejects_unsupported_database_versions_without_rewriting_them(self) -> None:
+        self.temp.init()
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+
+        for version in (999, 2):
+            with self.subTest(version=version):
+                connection = sqlite3.connect(str(database))
+                try:
+                    connection.execute(f"PRAGMA user_version = {version}")
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                result = self.temp.run(
+                    "init", "--project", str(self.temp.project), "--json"
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.count("\n"), 1)
+                envelope = self.temp.json_stdout(result)
+                self.assertEqual(envelope["error"]["code"], "UNSUPPORTED_STATE_SCHEMA")
+                self.assertEqual(
+                    envelope["error"]["details"],
+                    {"actual_version": version, "supported_version": 3},
+                )
+                connection = sqlite3.connect(str(database))
+                try:
+                    unchanged = connection.execute("PRAGMA user_version").fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertEqual(unchanged, version)
+
+    def test_private_metadata_write_retries_short_writes(self) -> None:
+        destination = self.temp.root / "short-write-project.json"
+        value = {
+            "schema_version": "offwork.project/v1",
+            "project_id": "project-short-write",
+            "project_path": str(self.temp.project),
+        }
+        real_write = os.write
+        write_sizes = []
+
+        def short_first_write(descriptor: int, payload: bytes) -> int:
+            requested = 7 if not write_sizes else len(payload)
+            written = real_write(descriptor, payload[:requested])
+            write_sizes.append(written)
+            return written
+
+        with mock.patch("offwork.project.os.write", side_effect=short_first_write):
+            _write_private_json(destination, value)
+
+        self.assertGreater(len(write_sizes), 1)
+        self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), value)
 
     def test_init_creates_exact_private_directories_under_restrictive_umask(self) -> None:
         result = self.temp.run(

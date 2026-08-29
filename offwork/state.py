@@ -200,7 +200,8 @@ def initialize_database(path: Path) -> None:
         expected_mode=PRIVATE_FILE_MODE,
         required=False,
     )
-    if existing is None:
+    is_new_database = existing is None
+    if is_new_database:
         try:
             descriptor = os.open(
                 path,
@@ -219,6 +220,17 @@ def initialize_database(path: Path) -> None:
             os.close(descriptor)
     validate_database_paths(path)
     with connect(path) as connection:
+        if not is_new_database:
+            actual_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if actual_version != SCHEMA_VERSION:
+                raise OffworkError(
+                    "UNSUPPORTED_STATE_SCHEMA",
+                    "Offwork database schema version is not supported",
+                    details={
+                        "actual_version": actual_version,
+                        "supported_version": SCHEMA_VERSION,
+                    },
+                )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -258,7 +270,8 @@ def initialize_database(path: Path) -> None:
             )
             """
         )
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        if is_new_database:
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     validate_database_paths(path)
 
 
@@ -464,6 +477,70 @@ class StateService:
                 details={"task_id": task_id, "capsule_id": resolved},
             )
         return dict(row)
+
+    def get_receipt_state(
+        self,
+        task_id: str,
+        capsule_id: Optional[str],
+    ) -> Dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            task_row = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                raise OffworkError(
+                    "TASK_NOT_FOUND",
+                    "Task does not exist",
+                    details={"task_id": task_id},
+                )
+
+            task = _task_row(task_row)
+            resolved_capsule_id = capsule_id or task["current_capsule_id"]
+            if not resolved_capsule_id:
+                raise OffworkError(
+                    "CAPSULE_NOT_FOUND",
+                    "Task has no captured Capsule",
+                    details={"task_id": task_id},
+                )
+            capsule_row = connection.execute(
+                "SELECT * FROM capsules WHERE capsule_id = ? AND task_id = ?",
+                (resolved_capsule_id, task_id),
+            ).fetchone()
+            if capsule_row is None:
+                raise OffworkError(
+                    "CAPSULE_NOT_FOUND",
+                    "Capsule does not exist for this Task",
+                    details={
+                        "task_id": task_id,
+                        "capsule_id": resolved_capsule_id,
+                    },
+                )
+            acceptance_row = connection.execute(
+                """
+                SELECT status, note, created_at, task_revision
+                FROM human_acceptance_events
+                WHERE capsule_id = ?
+                ORDER BY task_revision DESC
+                LIMIT 1
+                """,
+                (resolved_capsule_id,),
+            ).fetchone()
+
+        acceptance = (
+            {"status": "pending", "acted_at": None, "note": None}
+            if acceptance_row is None
+            else {
+                "status": acceptance_row["status"],
+                "acted_at": acceptance_row["created_at"],
+                "note": acceptance_row["note"],
+            }
+        )
+        return {
+            "task": task,
+            "capsule": dict(capsule_row),
+            "acceptance": acceptance,
+        }
 
     def capsule_registered(self, capsule_id: str) -> bool:
         with self._connect() as connection:
