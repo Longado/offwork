@@ -15,6 +15,8 @@ It does not prove that an Agent is correct. It gives the next Agent and the user
 
 Offwork is a Python 3.9+ standard-library CLI. It requires system Git and has no production package dependencies.
 
+The Loop 6 clean-clone proof was run on macOS 26.4.1 arm64 with Python 3.9.6 and Apple Git 2.50.1. The CLI targets POSIX process behavior; Linux is intended but was not independently verified in that run, and Windows support is not claimed.
+
 ## Run without installing
 
 From any directory, invoke the repository launcher by absolute path:
