@@ -4,6 +4,8 @@
 
 **Product contract:** [`PRD_V1.0.md`](./PRD_V1.0.md) is authoritative for product behavior and terminology. This plan defines implementation order only; it must not silently change the PRD.
 
+**Evolution sequence:** [`EVOLUTION_PLAN.md`](./EVOLUTION_PLAN.md) defines the approved loop order, expected user-visible effect, evidence, progress commits, and human PM gate for each iteration.
+
 **Goal:** Build a five-minute, zero-install prototype that proves a history-free Agent can inspect a structured Handoff Receipt, detect whether the explicit Git project changed after capture, and safely choose the correct first step.
 
 **Architecture:** Offwork is a local-first Python CLI. Each project owns a private SQLite database and immutable Capsule directories under `.offwork/`. A Receipt is a derived view over immutable capture evidence, persisted check results, current project freshness, and explicit Capsule-level human acceptance. It is not a workflow engine.

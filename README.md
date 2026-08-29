@@ -181,7 +181,7 @@ python3 -m unittest discover -v
 python3 -m compileall -q offwork tests
 ```
 
-The product contract is [PRD_V1.0.md](./PRD_V1.0.md). The implementation order and acceptance checklist are in [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md).
+The product contract is [PRD_V1.0.md](./PRD_V1.0.md). The implementation order and acceptance checklist are in [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md). The loop-by-loop product evolution and expected outcomes are in [EVOLUTION_PLAN.md](./EVOLUTION_PLAN.md), with the current explicit human decision in [PM_REVIEW.md](./PM_REVIEW.md).
 
 ## Explicit non-goals
 

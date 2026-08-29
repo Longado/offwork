@@ -17,7 +17,7 @@ This file keeps the human product decision visible throughout development. It is
 - Human PM reviewer: user or a human delegate explicitly named by the user
 - Status: `pending`
 - Opened: 2026-08-29
-- Decision requested: approve, reject, or change the proposed P1 remediation order before the branch is merged
+- Decision requested: approve, reject, or change the loop sequence in `EVOLUTION_PLAN.md`; approval of Loop 1 authorizes only the P1 trust-boundary remediation before another review
 
 ### Evidence prepared for review
 
@@ -25,6 +25,7 @@ This file keeps the human product decision visible throughout development. It is
 - Prototype implementation: six focused commits through `775c6db`
 - Automated baseline: `python3 -m unittest discover -v` passed 37 tests on 2026-08-29
 - Multi-Agent product and implementation review: completed; no files changed during review
+- Evolution plan: Loops 0–6 define one product question, expected user-visible effect, evidence, commits, and PM gate per iteration
 - Highest-priority findings:
   1. acceptance can be persisted before Capsule integrity failure is returned;
   2. fixed state paths and workspace scanning have symlink boundary risks;
