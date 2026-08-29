@@ -287,6 +287,13 @@ class HistoryFreeDecisionFixtureTests(unittest.TestCase):
         self.assertIn("only the explicit project path and CLI JSON envelope", prompt)
         self.assertIn("Do not open or infer prior Session history", prompt)
         self.assertIn("Do not execute the proposed first action", prompt)
+        self.assertIn('"cited_receipt_facts"', prompt)
+        self.assertIn('"proposed_first_action"', prompt)
+        self.assertIn('"receipt_path": "$.data.next_step, or null for stop"', prompt)
+        self.assertIn("Do not add other object fields", prompt)
+        self.assertIn("The citations must include at least", prompt)
+        self.assertIn("`$.data.next_step`", prompt)
+        self.assertIn("`$.error.details.freshness`", prompt)
         decision = response_schema["properties"]["decision"]
         self.assertEqual(decision["enum"], ["continue", "verify", "stop"])
         self.assertEqual(
@@ -358,6 +365,77 @@ class HistoryFreeDecisionFixtureTests(unittest.TestCase):
                 action_contracts[decision]["receipt_path"],
                 "$.data.next_step" if decision != "stop" else None,
             )
+
+    def test_recorded_real_runs_preserve_exact_evidence(self) -> None:
+        run_directory = FIXTURE_DIR / "runs" / "2026-08-29"
+        summary = json.loads((run_directory / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["schema_version"], "offwork.history-free-results/v1")
+        self.assertGreaterEqual(summary["overall_elapsed_ms"], 0)
+
+        for case in self.cases["cases"]:
+            case_id = case["case_id"]
+            record = json.loads((run_directory / f"{case_id}.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["schema_version"], "offwork.history-free-run/v1")
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["case_id"], case_id)
+            self.assertTrue(record["agent"])
+            self.assertTrue(record["commands"])
+            self.assertGreaterEqual(record["overall_elapsed_ms"], 0)
+            self.assertIsInstance(record["cli_json_envelope"], dict)
+            self.assertEqual(record["response"]["decision"], case["expected"]["decision"])
+            self.assertEqual(record["result"], "passed")
+            self.assertIn("human acceptance remained unchanged", record["note"])
+            self.assert_required_citations(record["cli_json_envelope"], case)
+
+            expected_action = case["expected"]["proposed_first_action"]
+            action = record["response"]["proposed_first_action"]
+            self.assertEqual(action["mode"], expected_action["mode"])
+            self.assertEqual(action["value"], expected_action["value"])
+            self.assertEqual(
+                action["receipt_path"],
+                "$.data.next_step" if case_id != "stop" else None,
+            )
+
+            envelope = record["cli_json_envelope"]
+            actual_citations = {
+                (
+                    citation["receipt_path"],
+                    json.dumps(citation["value"], sort_keys=True),
+                )
+                for citation in record["response"]["cited_receipt_facts"]
+            }
+            for citation in record["response"]["cited_receipt_facts"]:
+                value: Any = envelope
+                for component in citation["receipt_path"].removeprefix("$.").split("."):
+                    value = value[component]
+                self.assertEqual(value, citation["value"], citation["receipt_path"])
+            for required in case["expected"]["required_citations"]:
+                expected_citation = (
+                    required["receipt_path"],
+                    json.dumps(required["value"], sort_keys=True),
+                )
+                self.assertIn(expected_citation, actual_citations)
+
+            result = summary["cases"][case_id]
+            self.assertEqual(result["decision"], case["expected"]["decision"])
+            self.assertEqual(result["result"], "passed")
+            self.assertTrue(result["workspace_unchanged"])
+            self.assertEqual(result["human_acceptance"], "pending")
+            evidence = json.loads(
+                (run_directory / result["state_evidence"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                evidence["schema_version"],
+                "offwork.history-free-state-evidence/v1",
+            )
+            self.assertEqual(evidence["case_id"], case_id)
+            self.assertEqual(
+                evidence["observed_before_agent"],
+                evidence["observed_after_agent"],
+            )
+            self.assertTrue(evidence["unchanged"])
+            self.assertEqual(evidence["human_acceptance_status"], "pending")
+            self.assertEqual(evidence["human_acceptance_events"], [])
 
 
 if __name__ == "__main__":

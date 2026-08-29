@@ -1,0 +1,28 @@
+{
+  "schema_version": "offwork.history-free-results/v1",
+  "run_dir": "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z",
+  "overall_elapsed_ms": 146097,
+  "cases": {
+    "continue": {
+      "decision": "continue",
+      "result": "passed",
+      "state_evidence": "evidence/continue.json",
+      "workspace_unchanged": true,
+      "human_acceptance": "pending"
+    },
+    "verify": {
+      "decision": "verify",
+      "result": "passed",
+      "state_evidence": "evidence/verify.json",
+      "workspace_unchanged": true,
+      "human_acceptance": "pending"
+    },
+    "stop": {
+      "decision": "stop",
+      "result": "passed",
+      "state_evidence": "evidence/stop.json",
+      "workspace_unchanged": true,
+      "human_acceptance": "pending"
+    }
+  }
+}

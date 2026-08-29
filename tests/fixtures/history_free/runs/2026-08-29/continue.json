@@ -1,0 +1,155 @@
+{
+  "schema_version": "offwork.history-free-run/v1",
+  "status": "completed",
+  "case_id": "continue",
+  "agent": "Codex fresh sub-agent /root/history_free_continue_v3",
+  "commands": [
+    {
+      "purpose": "Produce the exact CLI JSON envelope supplied to the fresh Agent.",
+      "argv": [
+        "/Users/eddie/Documents/WAIC/offwork/.worktrees/prototype-vertical-slice/bin/offwork",
+        "resume",
+        "--task",
+        "task-2cd48438090b4d6f8f66e293b6eb06fe",
+        "--capsule",
+        "capsule-d7e0a3bd35014af1a4fb4e2601d7b6a3",
+        "--project",
+        "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z/continue/project",
+        "--json"
+      ],
+      "elapsed_ms": 233,
+      "exit_code": 0
+    }
+  ],
+  "overall_elapsed_ms": 146097,
+  "cli_json_envelope": {
+    "command": "resume",
+    "data": {
+      "agent_claimed": {
+        "items": [
+          "The tracked baseline is ready to continue."
+        ],
+        "source": "capture_context",
+        "summary": "The local implementation is ready for its captured next step."
+      },
+      "auto_checked": {
+        "checks": [
+          {
+            "argv": [
+              "/opt/homebrew/opt/python@3.13/bin/python3.13",
+              "-c",
+              "from pathlib import Path; assert Path('tracked.txt').read_text(encoding='utf-8') == 'captured\\n'"
+            ],
+            "command": "/opt/homebrew/opt/python@3.13/bin/python3.13 -c 'from pathlib import Path; assert Path('\"'\"'tracked.txt'\"'\"').read_text(encoding='\"'\"'utf-8'\"'\"') == '\"'\"'captured\\n'\"'\"''",
+            "cwd": "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z/continue/project",
+            "finished_at": "2026-08-29T07:49:11.252343+00:00",
+            "returncode": 0,
+            "started_at": "2026-08-29T07:49:11.217904+00:00",
+            "status": "passed"
+          }
+        ],
+        "schema_version": "offwork.checks/v1",
+        "status": "passed"
+      },
+      "capsule": {
+        "capsule_id": "capsule-d7e0a3bd35014af1a4fb4e2601d7b6a3",
+        "captured_at": "2026-08-29T07:49:11.409158+00:00"
+      },
+      "handoff_verified": {
+        "completeness": {
+          "missing_information": [],
+          "status": "complete"
+        },
+        "integrity": {
+          "status": "passed"
+        },
+        "restore": {
+          "status": "passed"
+        }
+      },
+      "human_acceptance": {
+        "acted_at": null,
+        "note": null,
+        "status": "pending"
+      },
+      "next_step": "Add the approved assertion to tracked.txt.",
+      "offwork_observed": {
+        "branch": "main",
+        "changed_paths": [],
+        "git_root": "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z/continue/project",
+        "head": "7cd42b4ef945bc7ad4826f4573c46f416787d5f0",
+        "project_id": "project-7f33c4f5be6a4d4eb5b8c8d7a6730fef",
+        "project_path": "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z/continue/project"
+      },
+      "open_loops": [],
+      "schema_version": "offwork.receipt/v1",
+      "task": {
+        "captured_revision": 2,
+        "current_revision": 2,
+        "goal": "Begin the captured next step from a fresh trusted workspace",
+        "task_id": "task-2cd48438090b4d6f8f66e293b6eb06fe",
+        "title": "Continue the verified local change"
+      },
+      "unknowns": [],
+      "workspace_freshness": {
+        "changes": [],
+        "checked_at": "2026-08-29T07:49:11.828496+00:00",
+        "limitations": [
+          "ignored files and external state are not checked"
+        ],
+        "scope": "explicit_git_project",
+        "status": "fresh"
+      }
+    },
+    "ok": true,
+    "schema_version": "offwork.cli/v1"
+  },
+  "response": {
+    "decision": "continue",
+    "cited_receipt_facts": [
+      {
+        "receipt_path": "$.data.handoff_verified.integrity.status",
+        "value": "passed",
+        "relevance": "Capsule integrity passed."
+      },
+      {
+        "receipt_path": "$.data.handoff_verified.restore.status",
+        "value": "passed",
+        "relevance": "Capsule restore passed."
+      },
+      {
+        "receipt_path": "$.data.workspace_freshness.status",
+        "value": "fresh",
+        "relevance": "The explicit Git workspace is fresh."
+      },
+      {
+        "receipt_path": "$.data.auto_checked.status",
+        "value": "passed",
+        "relevance": "Configured automatic checks passed."
+      },
+      {
+        "receipt_path": "$.data.unknowns",
+        "value": [],
+        "relevance": "No material Unknown is recorded."
+      },
+      {
+        "receipt_path": "$.data.open_loops",
+        "value": [],
+        "relevance": "No blocking open loop is recorded."
+      },
+      {
+        "receipt_path": "$.data.next_step",
+        "value": "Add the approved assertion to tracked.txt.",
+        "relevance": "This supplies the Receipt-grounded first project action."
+      }
+    ],
+    "proposed_first_action": {
+      "mode": "project_action",
+      "value": "Add the approved assertion to tracked.txt.",
+      "receipt_path": "$.data.next_step",
+      "reason": "Integrity and restore passed, the workspace is fresh, automatic checks passed, and no Unknown or open loop is recorded."
+    }
+  },
+  "result": "passed",
+  "note": "Real history-free Agent run. Exact CLI envelope and Agent response preserved; HEAD, Git index, project files, and human acceptance remained unchanged."
+}

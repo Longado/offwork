@@ -1,0 +1,44 @@
+{
+  "schema_version": "offwork.history-free-state-evidence/v1",
+  "case_id": "continue",
+  "project_path": "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z/continue/project",
+  "observed_before_agent": {
+    "acceptance": {
+      "events": [],
+      "task": [
+        2,
+        "capsule-d7e0a3bd35014af1a4fb4e2601d7b6a3"
+      ]
+    },
+    "head": "7cd42b4ef945bc7ad4826f4573c46f416787d5f0",
+    "index": "ea6c06d5cc43eb25d8ba6ecfcf49cda0738a2078d6b27f8f68067d497e97afd3",
+    "project_files": {
+      "tracked.txt": [
+        "file",
+        420,
+        "af9f5d825b4a9e493a23ea438db355287c4320107eb98c3542879fef26b82628"
+      ]
+    }
+  },
+  "observed_after_agent": {
+    "acceptance": {
+      "events": [],
+      "task": [
+        2,
+        "capsule-d7e0a3bd35014af1a4fb4e2601d7b6a3"
+      ]
+    },
+    "head": "7cd42b4ef945bc7ad4826f4573c46f416787d5f0",
+    "index": "ea6c06d5cc43eb25d8ba6ecfcf49cda0738a2078d6b27f8f68067d497e97afd3",
+    "project_files": {
+      "tracked.txt": [
+        "file",
+        420,
+        "af9f5d825b4a9e493a23ea438db355287c4320107eb98c3542879fef26b82628"
+      ]
+    }
+  },
+  "unchanged": true,
+  "human_acceptance_status": "pending",
+  "human_acceptance_events": []
+}
