@@ -45,7 +45,15 @@ class StartupCliTests(unittest.TestCase):
         self.assertEqual(envelope["data"]["project_path"], str(self.temp.project.resolve()))
         self.assertEqual(result.stderr, "")
 
+    def test_argument_error_still_returns_one_json_envelope(self) -> None:
+        result = self.temp.run("capture", "--json")
+
+        self.assertNotEqual(result.returncode, 0)
+        envelope = self.temp.json_stdout(result)
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], "INVALID_ARGUMENT")
+        self.assertEqual(result.stderr, "")
+
 
 if __name__ == "__main__":
     unittest.main()
-

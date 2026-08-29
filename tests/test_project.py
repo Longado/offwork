@@ -53,6 +53,17 @@ class ProjectInitializationTests(unittest.TestCase):
         self.assertFalse(envelope["ok"])
         self.assertEqual(envelope["error"]["code"], "UNSAFE_STATE_PATH")
 
+    def test_init_rejects_preexisting_wide_state_directory(self) -> None:
+        state_dir = self.temp.project / ".offwork"
+        state_dir.mkdir(mode=0o755)
+        os.chmod(state_dir, 0o755)
+
+        result = self.temp.run("init", "--project", str(self.temp.project), "--json")
+
+        self.assertNotEqual(result.returncode, 0)
+        envelope = self.temp.json_stdout(result)
+        self.assertEqual(envelope["error"]["code"], "UNSAFE_STATE_PATH")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,7 @@ def render_receipt(receipt: Dict[str, Any]) -> str:
     task = receipt["task"]
     capsule = receipt["capsule"]
     claimed = receipt["agent_claimed"]
+    observed = receipt["offwork_observed"]
     checks = receipt["auto_checked"]
     verified = receipt["handoff_verified"]
     freshness = receipt["workspace_freshness"]
@@ -72,7 +73,26 @@ def render_receipt(receipt: Dict[str, Any]) -> str:
         f"- {_visible(claimed['summary'])}",
     ]
     lines.extend(f"- {_visible(item)}" for item in claimed["items"])
+    lines.extend(
+        [
+            "",
+            "Observed by Offwork:",
+            f"- Project: {_visible(observed['project_path'])}",
+            f"- Branch: {_visible(observed.get('branch'))}",
+            f"- HEAD: {_visible(observed.get('head'))}",
+        ]
+    )
+    if observed.get("changed_paths"):
+        lines.append(
+            "- Captured changes: "
+            + ", ".join(_visible(path) for path in observed["changed_paths"])
+        )
     lines.extend(["", "Verified by Offwork:", f"- Checks: {checks['status']}"])
+    for check in checks["checks"]:
+        lines.append(
+            f"- {_visible(check['command'])}: {check['status']} "
+            f"(returncode={check['returncode']})"
+        )
     lines.extend(
         [
             f"- Integrity: {verified['integrity']['status']}",
@@ -90,7 +110,11 @@ def render_receipt(receipt: Dict[str, Any]) -> str:
             "",
             f"Next step: {_visible(receipt['next_step'])}",
             f"Workspace freshness: {freshness['status']}",
+            "Workspace changes: "
+            + (", ".join(_visible(path) for path in freshness["changes"]) or "none"),
             f"Human acceptance: {acceptance['status']}",
         ]
     )
+    if acceptance.get("note") is not None:
+        lines.append(f"Acceptance note: {_visible(acceptance['note'])}")
     return "\n".join(lines) + "\n"

@@ -42,11 +42,21 @@ def _reject_symlink(path: Path) -> None:
 
 def _ensure_directory(path: Path, mode: int) -> None:
     _reject_symlink(path)
+    existed = path.exists()
     path.mkdir(mode=mode, exist_ok=True)
     if not path.is_dir():
         raise OffworkError(
             "UNSAFE_STATE_PATH",
             "Expected a private directory",
+            details={"path": str(path)},
+        )
+    current = path.stat()
+    if existed and (
+        current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != mode
+    ):
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Existing Offwork directory has unsafe owner or permissions",
             details={"path": str(path)},
         )
     os.chmod(path, mode)

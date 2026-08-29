@@ -13,8 +13,17 @@ from offwork.capsule import capture
 from offwork.receipt import build_receipt
 
 
+class OffworkArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise OffworkError(
+            "INVALID_ARGUMENT",
+            message,
+            details={"usage": self.format_usage().strip()},
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = OffworkArgumentParser(
         prog="offwork",
         description="Local trusted handoff receipts for interrupted Agent work.",
     )
@@ -68,13 +77,16 @@ def _human_init(data: Dict[str, Any]) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
-    arguments = parser.parse_args(argv)
-    if not arguments.command:
-        parser.print_help()
-        return 0
-
+    raw_arguments = list(argv) if argv is not None else sys.argv[1:]
+    json_requested = "--json" in raw_arguments
+    command_hint = raw_arguments[0] if raw_arguments and not raw_arguments[0].startswith("-") else "cli"
+    arguments = None
     try:
+        parser = build_parser()
+        arguments = parser.parse_args(raw_arguments)
+        if not arguments.command:
+            parser.print_help()
+            return 0
         if arguments.command == "init":
             data = initialize_project(arguments.project)
             if arguments.json_output:
@@ -141,8 +153,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         raise OffworkError("UNKNOWN_COMMAND", "Unknown command")
     except OffworkError as error:
-        if getattr(arguments, "json_output", False):
-            write_json(error_envelope(arguments.command, error))
+        if json_requested or getattr(arguments, "json_output", False):
+            command = getattr(arguments, "command", None) or command_hint
+            write_json(error_envelope(command, error))
         else:
             print(f"{error.code}: {error.message}", file=sys.stderr)
         return error.exit_code
