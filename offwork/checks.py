@@ -84,6 +84,29 @@ def _validate_argv(argv: List[str]) -> None:
             _raise_unsafe_check_argument(argument_index=index)
 
 
+def validate_check_commands(commands: List[str]) -> List[List[str]]:
+    parsed_commands: List[List[str]] = []
+    for command_index, command in enumerate(commands):
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            _validate_malformed_command(command, command_index)
+            raise OffworkError(
+                "INVALID_CHECK_COMMAND",
+                "Check command could not be parsed",
+                details={"command_index": command_index},
+            ) from exc
+        if not argv:
+            raise OffworkError(
+                "INVALID_CHECK_COMMAND",
+                "Check command could not be parsed",
+                details={"command_index": command_index},
+            )
+        _validate_argv(argv)
+        parsed_commands.append(argv)
+    return parsed_commands
+
+
 def _process_group_exists(process_group: int) -> bool:
     try:
         os.killpg(process_group, 0)
@@ -244,38 +267,13 @@ def run_checks(commands: List[str], project: Path) -> Dict[str, Any]:
             "checks": [],
         }
 
-    parsed_commands: List[List[str]] = []
-    for command_index, command in enumerate(commands):
-        try:
-            argv = shlex.split(command)
-            if not argv:
-                raise ValueError("empty argv")
-        except ValueError:
-            _validate_malformed_command(command, command_index)
-            argv = []
-        else:
-            _validate_argv(argv)
-        parsed_commands.append(argv)
+    parsed_commands = validate_check_commands(commands)
 
     canonical_project = project.resolve(strict=True)
     total_deadline = time.monotonic() + TOTAL_CHECK_TIMEOUT_SECONDS
     results: List[Dict[str, Any]] = []
     for command, argv in zip(commands, parsed_commands):
         started_at = utc_now()
-        if not argv:
-            results.append(
-                {
-                    "command": command,
-                    "argv": [],
-                    "cwd": str(canonical_project),
-                    "status": "unavailable",
-                    "returncode": None,
-                    "started_at": started_at,
-                    "finished_at": utc_now(),
-                }
-            )
-            continue
-
         remaining = total_deadline - time.monotonic()
         if remaining <= 0:
             status = "unavailable"

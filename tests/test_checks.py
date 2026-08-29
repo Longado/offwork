@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import tempfile
 import time
@@ -13,6 +14,7 @@ from unittest import mock
 
 from offwork import checks
 from offwork.errors import OffworkError
+from offwork.state import StateService
 from tests.helpers import TempProject
 
 
@@ -179,6 +181,21 @@ class CheckRunnerTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "UNSAFE_CHECK_ARGUMENT")
                 self.assertFalse(marker.exists())
 
+    def test_unparsable_command_is_rejected_before_any_check_starts(self) -> None:
+        marker = self.project / "executed"
+        first = python_command(
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+            str(marker),
+        )
+        malformed = "/usr/bin/true -H Authoriza\\tion:\\ Bearer\\ path/secret '"
+
+        with self.assertRaises(OffworkError) as raised:
+            checks.run_checks([first, malformed], self.project)
+
+        self.assertEqual(raised.exception.code, "INVALID_CHECK_COMMAND")
+        self.assertEqual(raised.exception.details, {"command_index": 1})
+        self.assertFalse(marker.exists())
+
     def test_authorization_header_with_slash_is_rejected_before_execution(self) -> None:
         marker = self.project / "executed"
         source = "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')"
@@ -321,7 +338,11 @@ class CheckCredentialCaptureTests(unittest.TestCase):
             str(marker),
             "--token=secret",
         )
-        task = self.temp.add_task(checks=[command])
+        task = StateService(self.temp.project / ".offwork").add_task(
+            "legacy unsafe task",
+            "capture must still reject stored unsafe checks",
+            [command],
+        )
         context = self.temp.write_context(CONTEXT)
 
         result = self.temp.run(
@@ -341,6 +362,48 @@ class CheckCredentialCaptureTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         capsules = self.temp.project / ".offwork" / "capsules"
         self.assertEqual(list(capsules.iterdir()), [])
+
+    def test_task_add_rejects_invalid_checks_without_persisting_them(self) -> None:
+        cases = [
+            (
+                "/usr/bin/true --token=path/secret",
+                "UNSAFE_CHECK_ARGUMENT",
+            ),
+            (
+                "/usr/bin/true -H Authoriza\\tion:\\ Bearer\\ path/secret '",
+                "INVALID_CHECK_COMMAND",
+            ),
+        ]
+
+        for command, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                result = self.temp.run(
+                    "task",
+                    "add",
+                    "credential regression",
+                    "--goal",
+                    "reject before persistence",
+                    "--check",
+                    command,
+                    "--project",
+                    str(self.temp.project),
+                    "--json",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                envelope = json.loads(result.stdout)
+                self.assertEqual(envelope["error"]["code"], expected_code)
+                self.assertNotIn(command, result.stdout)
+                self.assertNotIn("path/secret", result.stdout)
+
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            task_count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(task_count, 0)
+        self.assertNotIn(b"path/secret", database.read_bytes())
 
 
 if __name__ == "__main__":

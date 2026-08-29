@@ -7,6 +7,7 @@ import sys
 from typing import Any, Dict, Optional, Sequence
 
 from offwork import __version__
+from offwork.checks import validate_check_commands
 from offwork.errors import OffworkError
 from offwork.output import (
     error_envelope,
@@ -159,6 +160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if arguments.command == "task" and arguments.task_command == "add":
             project = load_project(arguments.project)
+            validate_check_commands(arguments.check)
             task = StateService(project["state_dir"]).add_task(
                 arguments.title, arguments.goal, arguments.check
             )
