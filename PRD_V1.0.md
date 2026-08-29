@@ -74,6 +74,18 @@ Offwork 不自动运行 `next_step`，不启动或控制 Agent，不恢复、覆
 
 人类可读 Receipt 和 JSON 输出必须由同一个结构化对象渲染，不维护第二套事实。
 
+### 3.6 产品开发始终保留人类 PM 评审
+
+Offwork 的开发过程必须持续显示一个人类 PM 评审节点。Agent、多 Agent 审核和自动测试可以准备评审证据，但不能代替产品负责人作出接受、拒绝或范围决定。
+
+- 每个里程碑默认评审状态为 `pending`；
+- 只有用户或被明确指定的人类 PM 的显式决定可以改为 `accepted`、`rejected` 或 `changes_requested`；
+- commit、push、测试通过和技术审核不自动改变 PM 评审状态；
+- 里程碑是否完成、是否可合并以及下一批范围均由当前 PM 评审记录约束；
+- 该开发评审与 Capsule 的 `human_acceptance` 相互独立，不能互相推导。
+
+当前评审状态、证据和决定记录在 [`PM_REVIEW.md`](./PM_REVIEW.md)。
+
 ## 4. V1.0 范围
 
 ### 4.1 Included
