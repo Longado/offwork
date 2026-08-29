@@ -69,7 +69,6 @@ flowchart LR
 | Capsule 完整性 | JSON 和 SHA-256 manifest | 固定成员、内容哈希和 restore 时验证 |
 | 检查执行 | argv、`shell=False` 的 `subprocess` | 有界输出、预算、超时和 POSIX 进程组清理 |
 | 验证 | `unittest`、`compileall` 和 clean-clone 演示 | 生命周期、失败、篡改、恢复和无历史 Agent 证据 |
-| 可选 UI prototype | React 和 Vite | 仅用于本地视觉探索，不是生产依赖或 Agent 控制面 |
 
 ## 原型状态
 

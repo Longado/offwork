@@ -71,7 +71,6 @@ The arrows do not collapse the evidence into one optimistic status:
 | Capsule integrity | JSON and SHA-256 manifests | Fixed Capsule members, content hashes, and restore-time verification |
 | Check execution | `subprocess` with argv and `shell=False` | Authorized checks with bounded output, budgets, timeouts, and POSIX process-group cleanup |
 | Verification | `unittest`, `compileall`, and clean-clone demos | Lifecycle, failure, tamper, recovery, and history-free Agent evidence |
-| Optional UI prototype | React and Vite | Local visual exploration only; not a production dependency or Agent control plane |
 
 ## Prototype status
 
