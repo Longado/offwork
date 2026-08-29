@@ -13,11 +13,11 @@ This file keeps the human product decision visible throughout development. It is
 
 ## Current checkpoint
 
-- Milestone: Loop 1 — Trust boundary implementation
+- Milestone: Loops 1–6 — Continuous prototype execution
 - Human PM reviewer: user
 - Status: `pending`
 - Opened: 2026-08-29
-- Decision requested: after Loop 1 implementation and review evidence are available, accept, reject, or request changes before Loop 2 begins
+- Decision requested: review loop evidence as it is produced; execution may continue through Loop 6, but completion, merge, tag, and release remain pending explicit human decisions
 
 ### Evidence prepared for review
 
@@ -48,6 +48,13 @@ To be completed only after an explicit human decision:
 - Approved next scope:
 
 ## Review history
+
+### 2026-08-29 — Continuous execution through all seven loops
+
+- Reviewer: user
+- Status: `accepted`
+- Decision: Execute the complete Loop 0–6 prototype evolution without pausing for a new authorization between loops; use small commits and push progress to GitHub.
+- Boundary: This authorizes implementation only. It does not automatically accept any loop's evidence or approve merge, tag, or release.
 
 ### 2026-08-29 — Evolution plan and Loop 1 authorization
 
