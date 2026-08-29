@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "offwork.history-free-response/v1",
+  "$id": "response.schema.json",
   "title": "Offwork history-free Agent decision",
   "type": "object",
   "additionalProperties": false,
@@ -78,5 +78,67 @@
         }
       }
     }
-  }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "decision": {
+          "const": "continue"
+        },
+        "proposed_first_action": {
+          "properties": {
+            "mode": {
+              "const": "project_action"
+            },
+            "value": {
+              "const": "Add the approved assertion to tracked.txt."
+            },
+            "receipt_path": {
+              "const": "$.data.next_step"
+            }
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "decision": {
+          "const": "verify"
+        },
+        "proposed_first_action": {
+          "properties": {
+            "mode": {
+              "const": "verification"
+            },
+            "value": {
+              "const": "Review the diff for tracked.txt before modifying any project file."
+            },
+            "receipt_path": {
+              "const": "$.data.next_step"
+            }
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "decision": {
+          "const": "stop"
+        },
+        "proposed_first_action": {
+          "properties": {
+            "mode": {
+              "const": "none"
+            },
+            "value": {
+              "const": null
+            },
+            "receipt_path": {
+              "const": null
+            }
+          }
+        }
+      }
+    }
+  ]
 }

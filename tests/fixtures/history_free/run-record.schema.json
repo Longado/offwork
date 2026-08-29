@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "offwork.history-free-run/v1",
+  "$id": "run-record.schema.json",
   "title": "Offwork real history-free Agent run record",
   "type": "object",
   "additionalProperties": false,
@@ -11,6 +11,7 @@
     "agent",
     "commands",
     "overall_elapsed_ms",
+    "cli_json_envelope",
     "response",
     "result",
     "note"
@@ -79,10 +80,25 @@
       ],
       "minimum": 0
     },
+    "cli_json_envelope": {
+      "description": "The exact CLI JSON envelope supplied to the fresh Agent, without reconstruction or normalization.",
+      "oneOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "response": {
-      "type": [
-        "object",
-        "null"
+      "oneOf": [
+        {
+          "$ref": "response.schema.json"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "result": {
@@ -94,5 +110,48 @@
     "note": {
       "type": "string"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "completed",
+              "failed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "cli_json_envelope": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "const": "completed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "response": {
+            "$ref": "response.schema.json"
+          }
+        }
+      }
+    }
+  ]
 }

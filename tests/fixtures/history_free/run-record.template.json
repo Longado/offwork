@@ -5,7 +5,8 @@
   "agent": null,
   "commands": [],
   "overall_elapsed_ms": null,
+  "cli_json_envelope": null,
   "response": null,
   "result": null,
-  "note": "Template only. Populate commands, elapsed fields, response, and result after a real fresh-Agent run."
+  "note": "Template only. After a real fresh-Agent run, preserve the exact CLI JSON envelope and populate commands, elapsed fields, response, and result."
 }

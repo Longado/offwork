@@ -297,6 +297,7 @@ class HistoryFreeDecisionFixtureTests(unittest.TestCase):
         self.assertEqual(run_record["status"], "not_run")
         self.assertEqual(run_record["commands"], [])
         self.assertIsNone(run_record["overall_elapsed_ms"])
+        self.assertIsNone(run_record["cli_json_envelope"])
         self.assertIsNone(run_record["response"])
         command_schema = run_record_schema["properties"]["commands"]["items"]
         self.assertEqual(
@@ -307,6 +308,56 @@ class HistoryFreeDecisionFixtureTests(unittest.TestCase):
             run_record_schema["properties"]["status"]["enum"],
             ["not_run", "completed", "failed"],
         )
+        self.assertIn("cli_json_envelope", run_record_schema["required"])
+        envelope_schema = run_record_schema["properties"]["cli_json_envelope"]
+        self.assertIn("exact", envelope_schema["description"])
+        response_options = run_record_schema["properties"]["response"]["oneOf"]
+        self.assertIn({"$ref": "response.schema.json"}, response_options)
+        self.assertEqual(run_record_schema["$id"], "run-record.schema.json")
+        self.assertEqual(response_schema["$id"], "response.schema.json")
+        executed = run_record_schema["allOf"][0]
+        self.assertEqual(
+            executed["if"]["properties"]["status"]["enum"],
+            ["completed", "failed"],
+        )
+        self.assertEqual(
+            executed["then"]["properties"]["cli_json_envelope"]["type"],
+            "object",
+        )
+        completed = run_record_schema["allOf"][1]
+        self.assertEqual(
+            completed["if"]["properties"]["status"]["const"], "completed"
+        )
+        completed_properties = completed["then"]["properties"]
+        self.assertEqual(
+            completed_properties["response"], {"$ref": "response.schema.json"}
+        )
+
+    def test_response_schema_binds_each_decision_to_its_case_action(self) -> None:
+        response_schema = json.loads(
+            (FIXTURE_DIR / "response.schema.json").read_text(encoding="utf-8")
+        )
+        branches = response_schema["oneOf"]
+        action_contracts: Dict[str, Dict[str, Any]] = {}
+        for branch in branches:
+            decision = branch["properties"]["decision"]["const"]
+            action = branch["properties"]["proposed_first_action"]["properties"]
+            action_contracts[decision] = {
+                "mode": action["mode"]["const"],
+                "value": action["value"]["const"],
+                "receipt_path": action["receipt_path"]["const"],
+            }
+
+        self.assertEqual(set(action_contracts), {"continue", "verify", "stop"})
+        for case in self.cases["cases"]:
+            decision = case["expected"]["decision"]
+            expected_action = case["expected"]["proposed_first_action"]
+            self.assertEqual(action_contracts[decision]["mode"], expected_action["mode"])
+            self.assertEqual(action_contracts[decision]["value"], expected_action["value"])
+            self.assertEqual(
+                action_contracts[decision]["receipt_path"],
+                "$.data.next_step" if decision != "stop" else None,
+            )
 
 
 if __name__ == "__main__":
