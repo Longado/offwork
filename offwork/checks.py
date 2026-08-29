@@ -27,7 +27,7 @@ _AUTHORIZATION_HEADER = re.compile(
     re.IGNORECASE,
 )
 _URL_USER_INFO = re.compile(
-    r"(?:^|=)[a-z][a-z0-9+.-]*://[^/@\s]+@",
+    r"[a-z][a-z0-9+.-]*://[^/@\s]+@",
     re.IGNORECASE,
 )
 _RAW_SECRET_OPTION = re.compile(
@@ -35,7 +35,7 @@ _RAW_SECRET_OPTION = re.compile(
     re.IGNORECASE,
 )
 _RAW_AUTHORIZATION_HEADER = re.compile(
-    r"(?:^|\s)(?:-h\s*=?\s*|--header(?:=|\s+))?[\"']?"
+    r"(?:^|[\s\"'])(?:-h\s*=?\s*|--header(?:=|\s+))?[\"']?"
     r"authorization(?:\s*[:=]|\s*(?:[\"']|$))",
     re.IGNORECASE,
 )
@@ -63,7 +63,7 @@ def _is_authorization_header(argument: str) -> bool:
     return _AUTHORIZATION_HEADER.match(candidate) is not None
 
 
-def _validate_malformed_command(command: str, command_index: int) -> None:
+def _validate_raw_command(command: str, command_index: int) -> None:
     if (
         _RAW_SECRET_OPTION.search(command) is not None
         or _RAW_AUTHORIZATION_HEADER.search(command) is not None
@@ -87,10 +87,10 @@ def _validate_argv(argv: List[str]) -> None:
 def validate_check_commands(commands: List[str]) -> List[List[str]]:
     parsed_commands: List[List[str]] = []
     for command_index, command in enumerate(commands):
+        _validate_raw_command(command, command_index)
         try:
             argv = shlex.split(command)
         except ValueError as exc:
-            _validate_malformed_command(command, command_index)
             raise OffworkError(
                 "INVALID_CHECK_COMMAND",
                 "Check command could not be parsed",

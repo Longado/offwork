@@ -161,6 +161,26 @@ class CheckRunnerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "UNSAFE_CHECK_ARGUMENT")
         self.assertFalse(marker.exists())
 
+    def test_rejects_secrets_nested_inside_an_argv_string_before_execution(self) -> None:
+        marker = self.project / "executed"
+        cases = [
+            "url='https://alice:nested-secret@example.test/check'",
+            "args=['--token=nested-secret']",
+            "headers={'Authorization': 'Bearer nested-secret'}",
+        ]
+
+        for secret_source in cases:
+            with self.subTest(source=secret_source):
+                marker.unlink(missing_ok=True)
+                source = (
+                    f"{secret_source}; "
+                    "import pathlib; pathlib.Path('executed').write_text('ran')"
+                )
+                with self.assertRaises(OffworkError) as raised:
+                    checks.run_checks([python_command(source)], self.project)
+                self.assertEqual(raised.exception.code, "UNSAFE_CHECK_ARGUMENT")
+                self.assertFalse(marker.exists())
+
     def test_malformed_secret_command_is_rejected_before_any_check_starts(self) -> None:
         marker = self.project / "executed"
         first = python_command(
@@ -373,6 +393,22 @@ class CheckCredentialCaptureTests(unittest.TestCase):
                 "/usr/bin/true -H Authoriza\\tion:\\ Bearer\\ path/secret '",
                 "INVALID_CHECK_COMMAND",
             ),
+            (
+                python_command(
+                    "url='https://alice:nested-secret@example.test/check'"
+                ),
+                "UNSAFE_CHECK_ARGUMENT",
+            ),
+            (
+                python_command("args=['--token=nested-secret']"),
+                "UNSAFE_CHECK_ARGUMENT",
+            ),
+            (
+                python_command(
+                    "headers={'Authorization': 'Bearer nested-secret'}"
+                ),
+                "UNSAFE_CHECK_ARGUMENT",
+            ),
         ]
 
         for command, expected_code in cases:
@@ -395,6 +431,7 @@ class CheckCredentialCaptureTests(unittest.TestCase):
                 self.assertEqual(envelope["error"]["code"], expected_code)
                 self.assertNotIn(command, result.stdout)
                 self.assertNotIn("path/secret", result.stdout)
+                self.assertNotIn("nested-secret", result.stdout)
 
         database = self.temp.project / ".offwork" / "state.sqlite3"
         connection = sqlite3.connect(database)
@@ -404,6 +441,7 @@ class CheckCredentialCaptureTests(unittest.TestCase):
             connection.close()
         self.assertEqual(task_count, 0)
         self.assertNotIn(b"path/secret", database.read_bytes())
+        self.assertNotIn(b"nested-secret", database.read_bytes())
 
 
 if __name__ == "__main__":
