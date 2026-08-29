@@ -186,10 +186,33 @@ def create_private_directory(
         os.close(parent_descriptor)
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def _require_supported_schema(connection: sqlite3.Connection) -> None:
+    actual_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if actual_version != SCHEMA_VERSION:
+        raise OffworkError(
+            "UNSUPPORTED_STATE_SCHEMA",
+            "Offwork database schema version is not supported",
+            details={
+                "actual_version": actual_version,
+                "supported_version": SCHEMA_VERSION,
+            },
+        )
+
+
+def connect(
+    path: Path,
+    *,
+    require_supported_schema: bool = True,
+) -> sqlite3.Connection:
     validate_database_paths(path)
     connection = sqlite3.connect(str(path))
-    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        if require_supported_schema:
+            _require_supported_schema(connection)
+        connection.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -219,18 +242,9 @@ def initialize_database(path: Path) -> None:
         finally:
             os.close(descriptor)
     validate_database_paths(path)
-    with connect(path) as connection:
+    with connect(path, require_supported_schema=False) as connection:
         if not is_new_database:
-            actual_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if actual_version != SCHEMA_VERSION:
-                raise OffworkError(
-                    "UNSUPPORTED_STATE_SCHEMA",
-                    "Offwork database schema version is not supported",
-                    details={
-                        "actual_version": actual_version,
-                        "supported_version": SCHEMA_VERSION,
-                    },
-                )
+            _require_supported_schema(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (

@@ -8,7 +8,9 @@ import subprocess
 import unittest
 from unittest import mock
 
+from offwork.errors import OffworkError
 from offwork.project import _write_private_json, capture_workspace, load_project
+from offwork.state import StateService
 from tests.helpers import TempProject
 
 
@@ -217,6 +219,64 @@ class LoadedProjectBoundaryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         envelope = self.temp.json_stdout(result)
         self.assertEqual(envelope["error"]["code"], "UNSAFE_STATE_PATH")
+
+    def test_task_add_rejects_unsupported_schema_before_writing(self) -> None:
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        connection = sqlite3.connect(str(database))
+        try:
+            task_count_before = connection.execute(
+                "SELECT COUNT(*) FROM tasks"
+            ).fetchone()[0]
+            connection.execute("PRAGMA user_version = 999")
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = self.temp.run(
+            "task",
+            "add",
+            "must not be written",
+            "--goal",
+            "fail closed",
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        envelope = self.temp.json_stdout(result)
+        self.assertEqual(envelope["error"]["code"], "UNSUPPORTED_STATE_SCHEMA")
+        connection = sqlite3.connect(str(database))
+        try:
+            task_count_after = connection.execute(
+                "SELECT COUNT(*) FROM tasks"
+            ).fetchone()[0]
+            version_after = connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(task_count_after, task_count_before)
+        self.assertEqual(version_after, 999)
+
+    def test_state_read_rejects_unsupported_schema(self) -> None:
+        task = self.temp.add_task()
+        project = load_project(str(self.temp.project))
+        database = project["state_dir"] / "state.sqlite3"
+        connection = sqlite3.connect(str(database))
+        try:
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(OffworkError) as raised:
+            StateService(project["state_dir"]).get_task(task["task_id"])
+
+        self.assertEqual(raised.exception.code, "UNSUPPORTED_STATE_SCHEMA")
+        self.assertEqual(
+            raised.exception.details,
+            {"actual_version": 2, "supported_version": 3},
+        )
 
     def test_task_add_rejects_database_mode_changed_after_init(self) -> None:
         database = self.temp.project / ".offwork" / "state.sqlite3"
