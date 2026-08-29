@@ -15,6 +15,7 @@ from offwork.project import capture_workspace
 from offwork.state import (
     StateService,
     create_private_directory,
+    state_lock,
     utc_now,
     validate_private_path,
 )
@@ -22,6 +23,28 @@ from offwork.state import (
 
 PAYLOAD_NAMES = ("capsule.json", "checks.json", "restore-test.json")
 CAPSULE_MEMBERS = frozenset((*PAYLOAD_NAMES, "manifest.json"))
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _has_fixed_v1_context_structure(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("summary"), str)
+        and _is_string_list(value.get("agent_claims"))
+        and _is_string_list(value.get("unknowns"))
+        and isinstance(value.get("open_loops"), list)
+        and all(
+            isinstance(loop, dict)
+            and isinstance(loop.get("title"), str)
+            and isinstance(loop.get("disposition"), str)
+            and isinstance(loop.get("note"), str)
+            for loop in value["open_loops"]
+        )
+        and isinstance(value.get("next_step"), str)
+    )
 
 
 def _json_bytes(value: Dict[str, Any]) -> bytes:
@@ -60,6 +83,104 @@ def _integrity_error(capsule_id: str, message: str) -> OffworkError:
             "freshness": "not_evaluated",
         },
     )
+
+
+def _validate_fixed_v1_payloads(
+    values: Dict[str, Dict[str, Any]], capsule_id: str
+) -> None:
+    def has_optional_string(value: Dict[str, Any], name: str) -> bool:
+        return name in value and (
+            value[name] is None or isinstance(value[name], str)
+        )
+
+    def is_optional_integer(value: Any) -> bool:
+        return value is None or (
+            isinstance(value, int) and not isinstance(value, bool)
+        )
+
+    capsule = values["capsule.json"]
+    task = capsule.get("task")
+    context = capsule.get("context")
+    observed = capsule.get("observed")
+    snapshot = capsule.get("workspace_snapshot")
+    if (
+        not isinstance(capsule.get("captured_at"), str)
+        or not isinstance(task, dict)
+        or not isinstance(task.get("task_id"), str)
+        or not isinstance(task.get("title"), str)
+        or not isinstance(task.get("goal"), str)
+        or not isinstance(task.get("captured_revision"), int)
+        or isinstance(task.get("captured_revision"), bool)
+        or not _has_fixed_v1_context_structure(context)
+        or not isinstance(observed, dict)
+        or not isinstance(observed.get("project_id"), str)
+        or not isinstance(observed.get("project_path"), str)
+        or not has_optional_string(observed, "git_root")
+        or not has_optional_string(observed, "branch")
+        or not has_optional_string(observed, "head")
+        or not _is_string_list(observed.get("changed_paths"))
+        or not isinstance(snapshot, dict)
+        or snapshot.get("schema_version") != "offwork.workspace/v1"
+        or not isinstance(snapshot.get("reliable"), bool)
+        or not isinstance(snapshot.get("project_id"), str)
+        or not isinstance(snapshot.get("project_path"), str)
+    ):
+        raise _integrity_error(capsule_id, "Capsule payload structure is invalid")
+
+    if snapshot["reliable"]:
+        entries = snapshot.get("entries")
+        if (
+            not isinstance(snapshot.get("git_root"), str)
+            or not isinstance(snapshot.get("project_is_git_root"), bool)
+            or not has_optional_string(snapshot, "branch")
+            or not has_optional_string(snapshot, "head")
+            or not isinstance(entries, dict)
+            or not _is_string_list(snapshot.get("changed_paths"))
+            or any(
+                not isinstance(path, str)
+                or not isinstance(entry, dict)
+                or not isinstance(entry.get("type"), str)
+                or "mode" not in entry
+                or not is_optional_integer(entry.get("mode"))
+                or "sha256" not in entry
+                or not (
+                    entry["sha256"] is None
+                    or isinstance(entry["sha256"], str)
+                )
+                for path, entry in (entries.items() if isinstance(entries, dict) else ())
+            )
+        ):
+            raise _integrity_error(
+                capsule_id, "Capsule workspace snapshot structure is invalid"
+            )
+    elif not isinstance(snapshot.get("reason"), str):
+        raise _integrity_error(
+            capsule_id, "Capsule workspace snapshot structure is invalid"
+        )
+
+    checks = values["checks.json"]
+    check_items = checks.get("checks")
+    if (
+        not isinstance(checks.get("status"), str)
+        or not isinstance(check_items, list)
+        or any(
+            not isinstance(check, dict)
+            or not isinstance(check.get("command"), str)
+            or not _is_string_list(check.get("argv"))
+            or not isinstance(check.get("cwd"), str)
+            or not isinstance(check.get("status"), str)
+            or "returncode" not in check
+            or not is_optional_integer(check.get("returncode"))
+            or not isinstance(check.get("started_at"), str)
+            or not isinstance(check.get("finished_at"), str)
+            for check in (check_items if isinstance(check_items, list) else ())
+        )
+    ):
+        raise _integrity_error(capsule_id, "Capsule checks structure is invalid")
+
+    restore = values["restore-test.json"]
+    if not isinstance(restore.get("status"), str):
+        raise _integrity_error(capsule_id, "Capsule restore structure is invalid")
 
 
 def _read_private_member(path: Path, capsule_id: str, name: str) -> bytes:
@@ -118,6 +239,11 @@ def load_context(path: str) -> Dict[str, Any]:
             "INVALID_CAPTURE_CONTEXT",
             "Capture context requires agent_claims, unknowns, and open_loops arrays",
         )
+    if not _has_fixed_v1_context_structure(value):
+        raise OffworkError(
+            "INVALID_CAPTURE_CONTEXT",
+            "Capture context contains invalid nested values",
+        )
     return value
 
 
@@ -125,11 +251,32 @@ def capture(
     project: Dict[str, Any], task_id: str, context_path: str
 ) -> str:
     state = StateService(project["state_dir"])
-    reconcile_capsules(project, task_id)
     task = state.get_task(task_id)
     context = load_context(context_path)
     checks_value = run_checks(task["check_commands"], project["path"])
     workspace_snapshot = capture_workspace(project)
+    with state_lock(project["state_dir"]):
+        _reconcile_capsules_locked(project, task_id)
+        task = state.get_task(task_id)
+        return _capture_locked(
+            project,
+            state,
+            task,
+            context,
+            checks_value,
+            workspace_snapshot,
+        )
+
+
+def _capture_locked(
+    project: Dict[str, Any],
+    state: StateService,
+    task: Dict[str, Any],
+    context: Dict[str, Any],
+    checks_value: Dict[str, Any],
+    workspace_snapshot: Dict[str, Any],
+) -> str:
+    task_id = task["task_id"]
     capsule_id = f"capsule-{uuid.uuid4().hex}"
     captured_at = utc_now()
     captured_revision = task["revision"] + 1
@@ -295,6 +442,7 @@ def _verify_directory(
         values[name] = value
     if values["capsule.json"].get("capsule_id") != capsule_id:
         raise _integrity_error(capsule_id, "Capsule payload identity does not match its directory")
+    _validate_fixed_v1_payloads(values, capsule_id)
     return {
         "capsule": values["capsule.json"],
         "checks": values["checks.json"],
@@ -313,7 +461,9 @@ def load_capsule(
     return _verify_directory(directory, capsule_id, expected_manifest_hash)
 
 
-def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
+def _plan_capsule_reconciliation_locked(
+    project: Dict[str, Any], task_id: str
+) -> Dict[str, Any]:
     state = StateService(project["state_dir"])
     task = state.get_task(task_id)
     expected_revision = task["revision"]
@@ -360,40 +510,91 @@ def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
             skipped_candidates.append(candidate)
 
     if skipped_candidates:
+        status = "gap"
+        candidates = skipped_candidates
+    elif len(next_candidates) > 1:
+        status = "ambiguous"
+        candidates = next_candidates
+    elif next_candidates:
+        status = "exact_next"
+        candidates = next_candidates
+    else:
+        status = "none"
+        candidates = []
+    return {
+        "status": status,
+        "task": task,
+        "expected_captured_revision": next_revision,
+        "candidates": candidates,
+    }
+
+
+def _require_no_pending_capsule_reconciliation_locked(
+    project: Dict[str, Any], task_id: str
+) -> None:
+    plan = _plan_capsule_reconciliation_locked(project, task_id)
+    if plan["status"] == "none":
+        return
+    raise OffworkError(
+        "CAPSULE_RECONCILIATION_REQUIRED",
+        (
+            "Published Capsules require reconciliation; run task show or resume, "
+            "then retry with the refreshed Task revision"
+        ),
+        details={
+            "task_id": task_id,
+            "reconciliation_status": plan["status"],
+            "expected_captured_revision": plan["expected_captured_revision"],
+            "candidate_capsule_ids": sorted(
+                candidate["capsule_id"] for candidate in plan["candidates"]
+            ),
+        },
+    )
+
+
+def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
+    with state_lock(project["state_dir"]):
+        _reconcile_capsules_locked(project, task_id)
+
+
+def _reconcile_capsules_locked(project: Dict[str, Any], task_id: str) -> None:
+    plan = _plan_capsule_reconciliation_locked(project, task_id)
+    if plan["status"] == "gap":
         raise OffworkError(
             "CAPSULE_RECONCILIATION_GAP",
             "Published Capsules skip the Task's next revision",
             details={
                 "task_id": task_id,
-                "expected_captured_revision": next_revision,
+                "expected_captured_revision": plan["expected_captured_revision"],
                 "candidate_capsule_ids": sorted(
-                    candidate["capsule_id"] for candidate in skipped_candidates
+                    candidate["capsule_id"] for candidate in plan["candidates"]
                 ),
             },
         )
-    if len(next_candidates) > 1:
+    if plan["status"] == "ambiguous":
         raise OffworkError(
             "CAPSULE_RECONCILIATION_AMBIGUOUS",
             "Multiple published Capsules claim the Task's next revision",
             details={
                 "task_id": task_id,
-                "expected_captured_revision": next_revision,
+                "expected_captured_revision": plan["expected_captured_revision"],
                 "candidate_capsule_ids": sorted(
-                    candidate["capsule_id"] for candidate in next_candidates
+                    candidate["capsule_id"] for candidate in plan["candidates"]
                 ),
             },
         )
-    if not next_candidates:
+    if plan["status"] == "none":
         return
 
-    candidate = next_candidates[0]
-    state.reconcile_capsule(
+    candidate = plan["candidates"][0]
+    task = plan["task"]
+    StateService(project["state_dir"]).reconcile_capsule(
         capsule_id=candidate["capsule_id"],
         task_id=task_id,
         archive_path=candidate["archive_path"],
         manifest_hash=candidate["manifest_hash"],
         captured_revision=candidate["captured_revision"],
-        expected_revision=expected_revision,
+        expected_revision=task["revision"],
         expected_current_capsule_id=task["current_capsule_id"],
         created_at=candidate["created_at"],
     )

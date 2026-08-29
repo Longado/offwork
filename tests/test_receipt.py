@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
 import json
 import shutil
 import sqlite3
 import subprocess
+import threading
 import unittest
+from unittest import mock
 
+from offwork import capsule as capsule_module
+from offwork.capsule import capture
+from offwork.cli import main
+from offwork.project import load_project
+from offwork.state import StateService
 from tests.helpers import TempProject
 from tests.test_capsule import CONTEXT
 
@@ -492,6 +502,71 @@ class HumanAcceptanceTests(unittest.TestCase):
         current = events[-1][0] if events else "pending"
         return revision, len(events), current
 
+    def stored_handoff_state(self):
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            acceptances = connection.execute(
+                "SELECT capsule_id, status, task_revision FROM human_acceptance_events "
+                "ORDER BY task_revision"
+            ).fetchall()
+            registrations = connection.execute(
+                "SELECT capsule_id, captured_task_revision FROM capsules "
+                "WHERE task_id = ? ORDER BY captured_task_revision, capsule_id",
+                (self.task["task_id"],),
+            ).fetchall()
+        return task_row, acceptances, registrations
+
+    def prepare_pending_candidates(self, captured_revisions: list[int]) -> list[str]:
+        capsule_ids = []
+        for number in range(len(captured_revisions)):
+            context = dict(CONTEXT)
+            context["summary"] = f"published candidate {number}"
+            context_path = self.temp.write_context(context, f"candidate-{number}.json")
+            result = self.temp.run(
+                "capture", "--task", self.task["task_id"], "--context", str(context_path),
+                "--project", str(self.temp.project), "--json"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            capsule_ids.append(
+                self.temp.json_stdout(result)["data"]["capsule"]["capsule_id"]
+            )
+
+        capsules = self.temp.project / ".offwork" / "capsules"
+        for capsule_id, captured_revision in zip(capsule_ids, captured_revisions):
+            payload_path = capsules / capsule_id / "capsule.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            payload["task"]["captured_revision"] = captured_revision
+            payload_bytes = (
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+            ).encode()
+            payload_path.write_bytes(payload_bytes)
+            manifest_path = capsules / capsule_id / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"]["capsule.json"] = {
+                "size": len(payload_bytes),
+                "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            connection.executemany(
+                "DELETE FROM capsules WHERE capsule_id = ?",
+                [(capsule_id,) for capsule_id in capsule_ids],
+            )
+            connection.execute(
+                "UPDATE tasks SET revision = 2, current_capsule_id = ? WHERE task_id = ?",
+                (self.capsule_id, self.task["task_id"]),
+            )
+        return capsule_ids
+
     def test_successful_check_does_not_accept_capsule(self) -> None:
         self.assertEqual(self.receipt["auto_checked"]["status"], "passed")
         self.assertEqual(self.receipt["human_acceptance"]["status"], "pending")
@@ -564,6 +639,207 @@ class HumanAcceptanceTests(unittest.TestCase):
             "CAPSULE_INTEGRITY_FAILED",
         )
         self.assertEqual(self.stored_acceptance_state(), before)
+
+    def test_accept_tampered_target_does_not_reconcile_valid_orphan(self) -> None:
+        second_context = dict(CONTEXT)
+        second_context["summary"] = "published but not registered"
+        context_path = self.temp.write_context(second_context, "orphan.json")
+        captured = self.temp.run(
+            "capture", "--task", self.task["task_id"], "--context", str(context_path),
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(captured.returncode, 0, captured.stderr or captured.stdout)
+        orphan_id = self.temp.json_stdout(captured)["data"]["capsule"]["capsule_id"]
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            connection.execute("DELETE FROM capsules WHERE capsule_id = ?", (orphan_id,))
+            connection.execute(
+                "UPDATE tasks SET revision = 2, current_capsule_id = ? WHERE task_id = ?",
+                (self.capsule_id, self.task["task_id"]),
+            )
+
+        manifest = (
+            self.temp.project / ".offwork" / "capsules" / self.capsule_id / "manifest.json"
+        )
+        manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+        def stored_state():
+            with sqlite3.connect(str(database)) as connection:
+                task_row = connection.execute(
+                    "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                    (self.task["task_id"],),
+                ).fetchone()
+                acceptances = connection.execute(
+                    "SELECT capsule_id, status, task_revision FROM human_acceptance_events "
+                    "ORDER BY task_revision"
+                ).fetchall()
+                registrations = connection.execute(
+                    "SELECT capsule_id, captured_task_revision FROM capsules "
+                    "WHERE task_id = ? ORDER BY captured_task_revision",
+                    (self.task["task_id"],),
+                ).fetchall()
+            return task_row, acceptances, registrations
+
+        before = stored_state()
+        result = self.decide("accept", 2)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+        self.assertEqual(stored_state(), before)
+
+    def test_accept_requires_pending_exact_next_reconciliation_first(self) -> None:
+        orphan_id = self.prepare_pending_candidates([3])[0]
+        before = self.stored_handoff_state()
+
+        blocked = self.decide("accept", 2)
+
+        self.assertNotEqual(blocked.returncode, 0)
+        error = self.temp.json_stdout(blocked)["error"]
+        self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_REQUIRED")
+        self.assertEqual(error["details"]["reconciliation_status"], "exact_next")
+        self.assertEqual(error["details"]["candidate_capsule_ids"], [orphan_id])
+        self.assertEqual(self.stored_handoff_state(), before)
+
+        shown = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(shown.returncode, 0, shown.stderr or shown.stdout)
+        shown_receipt = self.temp.json_stdout(shown)["data"]
+        self.assertEqual(shown_receipt["capsule"]["capsule_id"], orphan_id)
+        self.assertEqual(shown_receipt["task"]["current_revision"], 3)
+
+        accepted = self.decide("accept", 3)
+
+        self.assertEqual(accepted.returncode, 0, accepted.stderr or accepted.stdout)
+        accepted_receipt = self.temp.json_stdout(accepted)["data"]
+        self.assertEqual(accepted_receipt["capsule"]["capsule_id"], self.capsule_id)
+        self.assertEqual(accepted_receipt["task"]["current_revision"], 4)
+        self.assertEqual(accepted_receipt["human_acceptance"]["status"], "accepted")
+
+    def test_accept_requires_pending_ambiguous_reconciliation_first(self) -> None:
+        candidate_ids = self.prepare_pending_candidates([3, 3])
+        before = self.stored_handoff_state()
+
+        result = self.decide("accept", 2)
+
+        self.assertNotEqual(result.returncode, 0)
+        error = self.temp.json_stdout(result)["error"]
+        self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_REQUIRED")
+        self.assertEqual(error["details"]["reconciliation_status"], "ambiguous")
+        self.assertEqual(
+            error["details"]["candidate_capsule_ids"], sorted(candidate_ids)
+        )
+        self.assertEqual(self.stored_handoff_state(), before)
+
+    def test_accept_requires_pending_gap_reconciliation_first(self) -> None:
+        candidate_id = self.prepare_pending_candidates([4])[0]
+        before = self.stored_handoff_state()
+
+        result = self.decide("accept", 2)
+
+        self.assertNotEqual(result.returncode, 0)
+        error = self.temp.json_stdout(result)["error"]
+        self.assertEqual(error["code"], "CAPSULE_RECONCILIATION_REQUIRED")
+        self.assertEqual(error["details"]["reconciliation_status"], "gap")
+        self.assertEqual(error["details"]["candidate_capsule_ids"], [candidate_id])
+        self.assertEqual(self.stored_handoff_state(), before)
+
+    def test_concurrent_capture_cannot_publish_between_acceptance_plan_and_cas(self) -> None:
+        project = load_project(str(self.temp.project))
+        context_path = self.temp.write_context(CONTEXT, "concurrent-capture.json")
+        plan_complete = threading.Event()
+        capture_at_registration = threading.Event()
+        acceptance_complete = threading.Event()
+        acceptance_result = []
+        capture_errors = []
+        stdout = io.StringIO()
+        real_require = capsule_module._require_no_pending_capsule_reconciliation_locked
+        real_register = StateService.register_capsule
+
+        def pause_after_plan(project_value, task_id):
+            real_require(project_value, task_id)
+            plan_complete.set()
+            capture_at_registration.wait(timeout=2)
+
+        def pause_before_registration(service, **arguments):
+            capture_at_registration.set()
+            if not acceptance_complete.wait(timeout=5):
+                raise AssertionError("acceptance did not complete")
+            return real_register(service, **arguments)
+
+        def accept_capsule() -> None:
+            try:
+                acceptance_result.append(
+                    main(
+                        [
+                            "task", "accept", self.task["task_id"],
+                            "--capsule", self.capsule_id,
+                            "--if-revision", "2",
+                            "--project", str(self.temp.project),
+                            "--json",
+                        ]
+                    )
+                )
+            finally:
+                acceptance_complete.set()
+
+        def capture_capsule() -> None:
+            try:
+                capture(project, self.task["task_id"], str(context_path))
+            except Exception as exc:
+                capture_errors.append(exc)
+
+        with mock.patch(
+            "offwork.cli._require_no_pending_capsule_reconciliation_locked",
+            side_effect=pause_after_plan,
+        ), mock.patch.object(
+            StateService, "register_capsule", autospec=True,
+            side_effect=pause_before_registration,
+        ), contextlib.redirect_stdout(stdout):
+            acceptance_thread = threading.Thread(target=accept_capsule)
+            acceptance_thread.start()
+            self.assertTrue(plan_complete.wait(timeout=5))
+            capture_thread = threading.Thread(target=capture_capsule)
+            capture_thread.start()
+            acceptance_thread.join(timeout=10)
+            capture_thread.join(timeout=10)
+
+        self.assertFalse(acceptance_thread.is_alive())
+        self.assertFalse(capture_thread.is_alive())
+        self.assertEqual(acceptance_result, [0])
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registrations = connection.execute(
+                "SELECT capsule_id FROM capsules WHERE task_id = ? ORDER BY capsule_id",
+                (self.task["task_id"],),
+            ).fetchall()
+        registered_ids = {row[0] for row in registrations}
+        published_ids = {
+            directory.name
+            for directory in (self.temp.project / ".offwork" / "capsules").iterdir()
+            if directory.name.startswith("capsule-")
+        }
+        self.assertEqual(registered_ids, published_ids)
+        self.assertEqual(capture_errors, [])
+        self.assertEqual(task_row[0], 4)
+        self.assertNotEqual(task_row[1], self.capsule_id)
+        shown = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(shown.returncode, 0, shown.stderr or shown.stdout)
+        self.assertEqual(
+            self.temp.json_stdout(shown)["data"]["capsule"]["capsule_id"],
+            task_row[1],
+        )
 
     def test_reject_tampered_payload_changes_no_acceptance_state(self) -> None:
         before = self.stored_acceptance_state()

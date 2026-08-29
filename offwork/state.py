@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import json
 import stat
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -75,6 +77,50 @@ def validate_database_paths(path: Path, *, required: bool = True) -> None:
             expected_mode=PRIVATE_FILE_MODE,
             required=False,
         )
+
+
+@contextmanager
+def state_lock(state_dir: Path):
+    lock_path = state_dir / "state.lock"
+    validate_private_path(
+        lock_path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork state lock could not be opened safely",
+            details={"path": str(lock_path)},
+        ) from exc
+    locked = False
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or stat.S_IMODE(current.st_mode) != PRIVATE_FILE_MODE
+        ):
+            raise OffworkError(
+                "UNSAFE_STATE_PATH",
+                "Offwork state lock changed during validation",
+                details={"path": str(lock_path)},
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    except OSError as exc:
+        raise OffworkError(
+            "STATE_LOCK_FAILED",
+            "Offwork state lock could not be acquired safely",
+            details={"path": str(lock_path)},
+        ) from exc
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def create_private_directory(

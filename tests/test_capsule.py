@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import sys
 import threading
@@ -13,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from offwork.capsule import _read_private_member, reconcile_capsules
+from offwork.capsule import CAPSULE_MEMBERS, _read_private_member, reconcile_capsules
 from offwork.cli import main
 from offwork.errors import OffworkError
 from offwork.project import load_project
@@ -33,6 +35,8 @@ CONTEXT = {
     ],
     "next_step": "运行旧 Token 迁移测试",
 }
+
+MISSING = object()
 
 
 class CapsuleCaptureTests(unittest.TestCase):
@@ -224,6 +228,124 @@ class CapsuleCaptureTests(unittest.TestCase):
         envelope = self.temp.json_stdout(result)
         self.assertEqual(envelope["error"]["code"], "INVALID_CAPTURE_CONTEXT")
 
+    def test_invalid_nested_context_is_rejected_before_checks_or_publication(self) -> None:
+        cases = [
+            ("agent claim item", {**CONTEXT, "agent_claims": [None]}),
+            ("unknown item", {**CONTEXT, "unknowns": [7]}),
+            ("open loop item", {**CONTEXT, "open_loops": [None]}),
+            (
+                "open loop title missing",
+                {
+                    **CONTEXT,
+                    "open_loops": [{"disposition": "resolve", "note": "check"}],
+                },
+            ),
+            (
+                "open loop title wrong",
+                {
+                    **CONTEXT,
+                    "open_loops": [
+                        {"title": [], "disposition": "resolve", "note": "check"}
+                    ],
+                },
+            ),
+            (
+                "open loop disposition missing",
+                {
+                    **CONTEXT,
+                    "open_loops": [{"title": "loop", "note": "check"}],
+                },
+            ),
+            (
+                "open loop disposition wrong",
+                {
+                    **CONTEXT,
+                    "open_loops": [
+                        {"title": "loop", "disposition": None, "note": "check"}
+                    ],
+                },
+            ),
+            (
+                "open loop note missing",
+                {
+                    **CONTEXT,
+                    "open_loops": [{"title": "loop", "disposition": "resolve"}],
+                },
+            ),
+            (
+                "open loop note wrong",
+                {
+                    **CONTEXT,
+                    "open_loops": [
+                        {"title": "loop", "disposition": "resolve", "note": {}}
+                    ],
+                },
+            ),
+        ]
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+
+        for number, (name, context) in enumerate(cases):
+            with self.subTest(name=name):
+                sentinel_name = f"invalid-context-check-{number}.txt"
+                command = (
+                    f"{shlex.quote(sys.executable)} -c \"from pathlib import Path; "
+                    f"Path('{sentinel_name}').write_text('ran')\""
+                )
+                task = self.temp.add_task(
+                    title=f"invalid context {number}", checks=[command]
+                )
+                context_path = self.temp.write_context(
+                    context, f"invalid-nested-{number}.json"
+                )
+                with sqlite3.connect(str(database)) as connection:
+                    before_task = connection.execute(
+                        "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchone()
+                    before_registrations = connection.execute(
+                        "SELECT capsule_id FROM capsules WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchall()
+                capsules = self.temp.project / ".offwork" / "capsules"
+                before_directories = sorted(path.name for path in capsules.iterdir())
+
+                result = self.temp.run(
+                    "capture", "--task", task["task_id"],
+                    "--context", str(context_path),
+                    "--project", str(self.temp.project), "--json"
+                )
+
+                with sqlite3.connect(str(database)) as connection:
+                    after_task = connection.execute(
+                        "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchone()
+                    after_registrations = connection.execute(
+                        "SELECT capsule_id FROM capsules WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchall()
+                sentinel = self.temp.project / sentinel_name
+                after_directories = sorted(path.name for path in capsules.iterdir())
+                self.assertEqual(
+                    (
+                        after_task,
+                        after_registrations,
+                        after_directories,
+                        sentinel.exists(),
+                    ),
+                    (
+                        before_task,
+                        before_registrations,
+                        before_directories,
+                        False,
+                    ),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self.temp.json_stdout(result)["error"]["code"],
+                    "INVALID_CAPTURE_CONTEXT",
+                )
+
     def test_unknown_task_does_not_publish_capsule(self) -> None:
         path = self.temp.write_context(CONTEXT)
         result = self.temp.run(
@@ -385,8 +507,11 @@ class CapsuleIntegrityTests(unittest.TestCase):
         self.replace_capsule_payload(capsule_id, payload)
 
     def replace_capsule_payload(self, capsule_id: str, payload) -> str:
+        return self.replace_payload_member(capsule_id, "capsule.json", payload)
+
+    def replace_payload_member(self, capsule_id: str, name: str, payload) -> str:
         directory = self.temp.project / ".offwork" / "capsules" / capsule_id
-        payload_path = directory / "capsule.json"
+        payload_path = directory / name
         payload_bytes = (
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
         ).encode()
@@ -394,7 +519,7 @@ class CapsuleIntegrityTests(unittest.TestCase):
 
         manifest_path = directory / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["files"]["capsule.json"] = {
+        manifest["files"][name] = {
             "size": len(payload_bytes),
             "sha256": hashlib.sha256(payload_bytes).hexdigest(),
         }
@@ -403,6 +528,341 @@ class CapsuleIntegrityTests(unittest.TestCase):
         ).encode()
         manifest_path.write_bytes(manifest_bytes)
         return hashlib.sha256(manifest_bytes).hexdigest()
+
+    def assert_malformed_orphan_is_ignored(self, mutate) -> None:
+        second = self.capture_another("malformed nested orphan")
+        second_capsule_id = second["capsule"]["capsule_id"]
+        self.orphan_capsule(second_capsule_id, 2, self.capsule_id)
+        mutate(second_capsule_id)
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"],
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        receipt = self.temp.json_stdout(result)["data"]
+        self.assertEqual(receipt["capsule"]["capsule_id"], self.capsule_id)
+        self.assertEqual(receipt["agent_claimed"]["summary"], CONTEXT["summary"])
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            task_row = connection.execute(
+                "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                (self.task["task_id"],),
+            ).fetchone()
+            registrations = connection.execute(
+                "SELECT capsule_id FROM capsules WHERE task_id = ? ORDER BY capsule_id",
+                (self.task["task_id"],),
+            ).fetchall()
+        self.assertEqual(task_row, (2, self.capsule_id))
+        self.assertEqual(registrations, [(self.capsule_id,)])
+
+    @staticmethod
+    def change_nested(payload, path, value) -> None:
+        target = payload
+        for component in path[:-1]:
+            target = target[component]
+        if value is MISSING:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
+
+    def fixed_v1_structure_cases(self):
+        valid_check = {
+            "command": "git status --short",
+            "argv": ["git", "status", "--short"],
+            "cwd": str(self.temp.project),
+            "status": "passed",
+            "returncode": 0,
+            "started_at": "2026-08-29T00:00:00+00:00",
+            "finished_at": "2026-08-29T00:00:01+00:00",
+        }
+
+        def case(name, member, path, value, prepare=None):
+            def mutate(payload):
+                if prepare is not None:
+                    prepare(payload)
+                self.change_nested(payload, path, value)
+
+            return name, member, mutate
+
+        def prepare_check(payload):
+            payload["status"] = "passed"
+            payload["checks"] = [copy.deepcopy(valid_check)]
+
+        return [
+            case("captured_at missing", "capsule.json", ("captured_at",), MISSING),
+            case("task id wrong", "capsule.json", ("task", "task_id"), None),
+            case("task title missing", "capsule.json", ("task", "title"), MISSING),
+            case("task goal wrong", "capsule.json", ("task", "goal"), []),
+            case(
+                "task captured revision bool",
+                "capsule.json",
+                ("task", "captured_revision"),
+                True,
+            ),
+            case("context summary missing", "capsule.json", ("context", "summary"), MISSING),
+            case("context next step wrong", "capsule.json", ("context", "next_step"), 7),
+            case(
+                "context agent claims wrong",
+                "capsule.json",
+                ("context", "agent_claims"),
+                {},
+            ),
+            case(
+                "context agent claim item wrong",
+                "capsule.json",
+                ("context", "agent_claims", 0),
+                None,
+            ),
+            case("context unknowns missing", "capsule.json", ("context", "unknowns"), MISSING),
+            case(
+                "context unknown item wrong",
+                "capsule.json",
+                ("context", "unknowns", 0),
+                {},
+            ),
+            case(
+                "context open loops wrong",
+                "capsule.json",
+                ("context", "open_loops"),
+                None,
+            ),
+            case(
+                "open loop title missing",
+                "capsule.json",
+                ("context", "open_loops", 0, "title"),
+                MISSING,
+            ),
+            case(
+                "open loop disposition wrong",
+                "capsule.json",
+                ("context", "open_loops", 0, "disposition"),
+                [],
+            ),
+            case(
+                "open loop note missing",
+                "capsule.json",
+                ("context", "open_loops", 0, "note"),
+                MISSING,
+            ),
+            case(
+                "observed project id missing",
+                "capsule.json",
+                ("observed", "project_id"),
+                MISSING,
+            ),
+            case(
+                "observed project path wrong",
+                "capsule.json",
+                ("observed", "project_path"),
+                None,
+            ),
+            case("observed git root missing", "capsule.json", ("observed", "git_root"), MISSING),
+            case("observed branch wrong", "capsule.json", ("observed", "branch"), []),
+            case("observed head missing", "capsule.json", ("observed", "head"), MISSING),
+            case(
+                "observed changed paths wrong",
+                "capsule.json",
+                ("observed", "changed_paths"),
+                {},
+            ),
+            case(
+                "snapshot reliable wrong",
+                "capsule.json",
+                ("workspace_snapshot", "reliable"),
+                1,
+            ),
+            case(
+                "snapshot project id missing",
+                "capsule.json",
+                ("workspace_snapshot", "project_id"),
+                MISSING,
+            ),
+            case(
+                "snapshot project path wrong",
+                "capsule.json",
+                ("workspace_snapshot", "project_path"),
+                [],
+            ),
+            case(
+                "snapshot git root missing",
+                "capsule.json",
+                ("workspace_snapshot", "git_root"),
+                MISSING,
+            ),
+            case(
+                "snapshot git-root flag wrong",
+                "capsule.json",
+                ("workspace_snapshot", "project_is_git_root"),
+                "yes",
+            ),
+            case(
+                "snapshot branch missing",
+                "capsule.json",
+                ("workspace_snapshot", "branch"),
+                MISSING,
+            ),
+            case(
+                "snapshot head wrong",
+                "capsule.json",
+                ("workspace_snapshot", "head"),
+                {},
+            ),
+            case(
+                "snapshot entries wrong",
+                "capsule.json",
+                ("workspace_snapshot", "entries"),
+                [],
+            ),
+            case(
+                "snapshot entry wrong",
+                "capsule.json",
+                ("workspace_snapshot", "entries", "tracked.txt"),
+                None,
+            ),
+            case(
+                "snapshot entry type missing",
+                "capsule.json",
+                ("workspace_snapshot", "entries", "tracked.txt", "type"),
+                MISSING,
+            ),
+            case(
+                "snapshot entry mode wrong",
+                "capsule.json",
+                ("workspace_snapshot", "entries", "tracked.txt", "mode"),
+                "644",
+            ),
+            case(
+                "snapshot entry hash wrong",
+                "capsule.json",
+                ("workspace_snapshot", "entries", "tracked.txt", "sha256"),
+                1,
+            ),
+            case(
+                "snapshot changed paths missing",
+                "capsule.json",
+                ("workspace_snapshot", "changed_paths"),
+                MISSING,
+            ),
+            case("checks status missing", "checks.json", ("status",), MISSING),
+            case("checks list wrong", "checks.json", ("checks",), None),
+            case(
+                "check command missing",
+                "checks.json",
+                ("checks", 0, "command"),
+                MISSING,
+                prepare_check,
+            ),
+            case(
+                "check argv wrong",
+                "checks.json",
+                ("checks", 0, "argv"),
+                {},
+                prepare_check,
+            ),
+            case(
+                "check cwd missing",
+                "checks.json",
+                ("checks", 0, "cwd"),
+                MISSING,
+                prepare_check,
+            ),
+            case(
+                "check status wrong",
+                "checks.json",
+                ("checks", 0, "status"),
+                None,
+                prepare_check,
+            ),
+            case(
+                "check returncode wrong",
+                "checks.json",
+                ("checks", 0, "returncode"),
+                "0",
+                prepare_check,
+            ),
+            case(
+                "check started_at missing",
+                "checks.json",
+                ("checks", 0, "started_at"),
+                MISSING,
+                prepare_check,
+            ),
+            case(
+                "check finished_at wrong",
+                "checks.json",
+                ("checks", 0, "finished_at"),
+                [],
+                prepare_check,
+            ),
+            case("restore status missing", "restore-test.json", ("status",), MISSING),
+        ]
+
+    def reset_to_initial_capsule(self) -> None:
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            connection.execute(
+                "DELETE FROM capsules WHERE capsule_id != ?", (self.capsule_id,)
+            )
+            connection.execute(
+                "UPDATE tasks SET revision = 2, current_capsule_id = ? WHERE task_id = ?",
+                (self.capsule_id, self.task["task_id"]),
+            )
+        capsules = self.temp.project / ".offwork" / "capsules"
+        for directory in capsules.iterdir():
+            if directory.name != self.capsule_id:
+                shutil.rmtree(directory)
+
+    def test_registered_fixed_v1_nested_fields_are_structurally_validated(self) -> None:
+        originals = {
+            name: (self.capsule_dir / name).read_bytes()
+            for name in CAPSULE_MEMBERS
+        }
+        original_manifest_hash = hashlib.sha256(originals["manifest.json"]).hexdigest()
+        for name, member, mutate in self.fixed_v1_structure_cases():
+            with self.subTest(name=name):
+                try:
+                    payload = json.loads(originals[member])
+                    mutate(payload)
+                    manifest_hash = self.replace_payload_member(
+                        self.capsule_id, member, payload
+                    )
+                    self.register_manifest_hash(self.capsule_id, manifest_hash)
+
+                    result = self.show()
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        self.temp.json_stdout(result)["error"]["code"],
+                        "CAPSULE_INTEGRITY_FAILED",
+                    )
+                finally:
+                    for original_name, original_bytes in originals.items():
+                        (self.capsule_dir / original_name).write_bytes(original_bytes)
+                    self.register_manifest_hash(
+                        self.capsule_id, original_manifest_hash
+                    )
+
+    def test_orphan_fixed_v1_nested_fields_are_ignored_without_state_change(self) -> None:
+        for name, member, mutate in self.fixed_v1_structure_cases():
+            with self.subTest(name=name):
+                try:
+                    def malformed(capsule_id):
+                        path = (
+                            self.temp.project
+                            / ".offwork"
+                            / "capsules"
+                            / capsule_id
+                            / member
+                        )
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                        mutate(payload)
+                        self.replace_payload_member(capsule_id, member, payload)
+
+                    self.assert_malformed_orphan_is_ignored(malformed)
+                finally:
+                    self.reset_to_initial_capsule()
 
     def replace_manifest(self, capsule_id: str, manifest) -> str:
         manifest_path = (
@@ -496,6 +956,21 @@ class CapsuleIntegrityTests(unittest.TestCase):
 
     def test_hash_consistent_non_object_registered_payload_is_integrity_failure(self) -> None:
         manifest_hash = self.replace_capsule_payload(self.capsule_id, [])
+        self.register_manifest_hash(self.capsule_id, manifest_hash)
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+
+    def test_hash_consistent_registered_null_context_is_integrity_failure(self) -> None:
+        payload_path = self.capsule_dir / "capsule.json"
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        payload["context"] = None
+        manifest_hash = self.replace_capsule_payload(self.capsule_id, payload)
         self.register_manifest_hash(self.capsule_id, manifest_hash)
 
         result = self.show()
@@ -783,28 +1258,19 @@ class CapsuleIntegrityTests(unittest.TestCase):
         project = load_project(str(self.temp.project))
         barrier = threading.Barrier(2)
         errors: list[Exception] = []
-        from offwork import capsule as capsule_module
-
-        real_verify = capsule_module._verify_directory
-
-        def synchronized_verify(directory, capsule_id, expected_manifest_hash):
-            loaded = real_verify(directory, capsule_id, expected_manifest_hash)
-            if capsule_id == second_capsule_id and expected_manifest_hash is None:
-                barrier.wait(timeout=5)
-            return loaded
 
         def run_reconciler() -> None:
             try:
+                barrier.wait(timeout=5)
                 reconcile_capsules(project, self.task["task_id"])
             except Exception as exc:  # captured for the main test thread
                 errors.append(exc)
 
-        with mock.patch("offwork.capsule._verify_directory", side_effect=synchronized_verify):
-            threads = [threading.Thread(target=run_reconciler) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
+        threads = [threading.Thread(target=run_reconciler) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
 
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
@@ -876,6 +1342,49 @@ class CapsuleIntegrityTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(task_row, (2, self.capsule_id))
         self.assertEqual(registrations, [(self.capsule_id,)])
+
+    def test_hash_consistent_orphan_with_null_context_is_ignored(self) -> None:
+        def malformed(capsule_id):
+            self.rewrite_capsule_payload(
+                capsule_id, lambda payload: payload.update({"context": None})
+            )
+
+        self.assert_malformed_orphan_is_ignored(malformed)
+
+    def test_hash_consistent_orphan_with_malformed_snapshot_entries_is_ignored(self) -> None:
+        def malformed(capsule_id):
+            self.rewrite_capsule_payload(
+                capsule_id,
+                lambda payload: payload["workspace_snapshot"].update({"entries": None}),
+            )
+
+        self.assert_malformed_orphan_is_ignored(malformed)
+
+    def test_hash_consistent_orphan_with_malformed_checks_is_ignored(self) -> None:
+        def malformed(capsule_id):
+            path = (
+                self.temp.project / ".offwork" / "capsules" / capsule_id / "checks.json"
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["checks"] = None
+            self.replace_payload_member(capsule_id, "checks.json", payload)
+
+        self.assert_malformed_orphan_is_ignored(malformed)
+
+    def test_hash_consistent_orphan_with_malformed_restore_status_is_ignored(self) -> None:
+        def malformed(capsule_id):
+            path = (
+                self.temp.project
+                / ".offwork"
+                / "capsules"
+                / capsule_id
+                / "restore-test.json"
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["status"] = None
+            self.replace_payload_member(capsule_id, "restore-test.json", payload)
+
+        self.assert_malformed_orphan_is_ignored(malformed)
 
     def test_hash_consistent_non_object_orphan_manifest_is_ignored(self) -> None:
         self.assert_orphan_manifest_is_ignored(lambda _capsule_id: [])

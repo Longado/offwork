@@ -8,9 +8,14 @@ from offwork.state import StateService, utc_now
 
 
 def build_receipt(
-    project: Dict[str, Any], task_id: str, capsule_id: Optional[str] = None
+    project: Dict[str, Any],
+    task_id: str,
+    capsule_id: Optional[str] = None,
+    *,
+    reconcile_orphans: bool = True,
 ) -> Dict[str, Any]:
-    reconcile_capsules(project, task_id)
+    if reconcile_orphans:
+        reconcile_capsules(project, task_id)
     state = StateService(project["state_dir"])
     task = state.get_task(task_id)
     capsule_row = state.get_capsule(task_id, capsule_id)

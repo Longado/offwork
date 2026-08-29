@@ -8,9 +8,12 @@ from offwork import __version__
 from offwork.errors import OffworkError
 from offwork.output import error_envelope, render_receipt, success_envelope, write_json
 from offwork.project import initialize_project, load_project
-from offwork.state import StateService
-from offwork.capsule import capture
+from offwork.capsule import (
+    _require_no_pending_capsule_reconciliation_locked,
+    capture,
+)
 from offwork.receipt import build_receipt
+from offwork.state import StateService, state_lock
 
 
 class OffworkArgumentParser(argparse.ArgumentParser):
@@ -130,15 +133,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if arguments.command == "task" and arguments.task_command in {"accept", "reject"}:
             project = load_project(arguments.project)
             state = StateService(project["state_dir"])
-            state.validate_acceptance_target(arguments.task_id, arguments.capsule)
-            receipt = build_receipt(project, arguments.task_id, arguments.capsule)
-            acceptance = state.record_acceptance(
-                task_id=arguments.task_id,
-                capsule_id=arguments.capsule,
-                expected_revision=arguments.if_revision,
-                status="accepted" if arguments.task_command == "accept" else "rejected",
-                note=arguments.note,
-            )
+            with state_lock(project["state_dir"]):
+                state.validate_acceptance_target(arguments.task_id, arguments.capsule)
+                receipt = build_receipt(
+                    project,
+                    arguments.task_id,
+                    arguments.capsule,
+                    reconcile_orphans=False,
+                )
+                _require_no_pending_capsule_reconciliation_locked(
+                    project, arguments.task_id
+                )
+                acceptance = state.record_acceptance(
+                    task_id=arguments.task_id,
+                    capsule_id=arguments.capsule,
+                    expected_revision=arguments.if_revision,
+                    status=(
+                        "accepted"
+                        if arguments.task_command == "accept"
+                        else "rejected"
+                    ),
+                    note=arguments.note,
+                )
             receipt["task"]["current_revision"] = acceptance["task_revision"]
             receipt["human_acceptance"] = {
                 "status": acceptance["status"],
