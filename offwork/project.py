@@ -20,6 +20,19 @@ from offwork.state import (
 
 
 STATE_DIR_NAME = ".offwork"
+GIT_OBSERVATION_TIMEOUT_SECONDS = 5.0
+
+
+class _GitObservationUnavailable(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _WorkspacePathUnavailable(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def canonical_project(path: str) -> Path:
@@ -233,14 +246,23 @@ def load_project(path: str) -> Dict[str, Any]:
 
 
 def _git(project: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["git", "-C", str(project), *arguments],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        shell=False,
-    )
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        return subprocess.run(
+            ["git", "-c", "core.fsmonitor=", "-C", str(project), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            shell=False,
+            timeout=GIT_OBSERVATION_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _GitObservationUnavailable("git_timeout") from exc
+    except OSError as exc:
+        raise _GitObservationUnavailable("git_unavailable") from exc
 
 
 def _metadata(project: Path, name: str, *arguments: str) -> str | None:
@@ -263,7 +285,97 @@ def _project_relative(repo_path: str, prefix: str) -> str | None:
     return normalized
 
 
+def _snapshot_entry(project_descriptor: int, relative: str) -> Dict[str, Any]:
+    components = relative.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise _WorkspacePathUnavailable("unsafe_workspace_path")
+
+    try:
+        parent_descriptor = os.dup(project_descriptor)
+    except OSError as exc:
+        raise _WorkspacePathUnavailable("unsafe_workspace_path") from exc
+    try:
+        for component in components[:-1]:
+            try:
+                child_descriptor = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                return {"type": "missing", "mode": None, "sha256": None}
+            except OSError as exc:
+                raise _WorkspacePathUnavailable("unsafe_workspace_path") from exc
+            os.close(parent_descriptor)
+            parent_descriptor = child_descriptor
+
+        leaf = components[-1]
+        try:
+            path_stat = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"type": "missing", "mode": None, "sha256": None}
+        except OSError as exc:
+            raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+
+        mode = stat.S_IMODE(path_stat.st_mode)
+        if stat.S_ISLNK(path_stat.st_mode):
+            try:
+                target = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
+            except OSError as exc:
+                raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+            return {
+                "type": "symlink",
+                "mode": mode,
+                "sha256": hashlib.sha256(target).hexdigest(),
+            }
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise _WorkspacePathUnavailable("unsupported_path_type")
+
+        try:
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as exc:
+            raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+        try:
+            current = os.fstat(descriptor)
+            if not stat.S_ISREG(current.st_mode):
+                raise _WorkspacePathUnavailable("required_path_unreadable")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return {
+                "type": "file",
+                "mode": stat.S_IMODE(current.st_mode),
+                "sha256": digest.hexdigest(),
+            }
+        except OSError as exc:
+            raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
 def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return _capture_workspace(project)
+    except _GitObservationUnavailable as exc:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": exc.reason,
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+
+
+def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
     project_path: Path = project["path"]
     root_text = _metadata(project_path, "root", "rev-parse", "--show-toplevel")
     if root_text is None:
@@ -318,51 +430,38 @@ def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
             }
 
     entries: Dict[str, Dict[str, Any]] = {}
-    for raw_path in listed.stdout.split(b"\0"):
-        if not raw_path:
-            continue
-        repo_path = os.fsdecode(raw_path)
-        relative = _project_relative(repo_path, prefix)
-        if relative is None:
-            continue
-        absolute = project_path / relative
-        try:
-            path_stat = absolute.lstat()
-        except FileNotFoundError:
-            entries[relative] = {"type": "missing", "mode": None, "sha256": None}
-            continue
-        mode = stat.S_IMODE(path_stat.st_mode)
-        if stat.S_ISLNK(path_stat.st_mode):
-            target = os.fsencode(os.readlink(absolute))
-            entries[relative] = {
-                "type": "symlink",
-                "mode": mode,
-                "sha256": hashlib.sha256(target).hexdigest(),
-            }
-        elif stat.S_ISREG(path_stat.st_mode):
-            try:
-                content = absolute.read_bytes()
-            except OSError:
-                return {
-                    "schema_version": "offwork.workspace/v1",
-                    "reliable": False,
-                    "reason": "required_path_unreadable",
-                    "project_id": project["project_id"],
-                    "project_path": project["project_path"],
-                }
-            entries[relative] = {
-                "type": "file",
-                "mode": mode,
-                "sha256": hashlib.sha256(content).hexdigest(),
-            }
-        else:
-            return {
-                "schema_version": "offwork.workspace/v1",
-                "reliable": False,
-                "reason": "unsupported_path_type",
-                "project_id": project["project_id"],
-                "project_path": project["project_path"],
-            }
+    try:
+        project_descriptor = os.open(
+            project_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "unsafe_workspace_path",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    try:
+        for raw_path in listed.stdout.split(b"\0"):
+            if not raw_path:
+                continue
+            repo_path = os.fsdecode(raw_path)
+            relative = _project_relative(repo_path, prefix)
+            if relative is None:
+                continue
+            entries[relative] = _snapshot_entry(project_descriptor, relative)
+    except _WorkspacePathUnavailable as exc:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": exc.reason,
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    finally:
+        os.close(project_descriptor)
 
     status_result = _git(
         git_root,

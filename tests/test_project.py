@@ -6,7 +6,9 @@ import shutil
 import sqlite3
 import subprocess
 import unittest
+from unittest import mock
 
+from offwork.project import capture_workspace, load_project
 from tests.helpers import TempProject
 
 
@@ -242,6 +244,98 @@ class LoadedProjectBoundaryTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
         envelope = self.temp.json_stdout(result)
         self.assertEqual(envelope["error"]["code"], "UNSAFE_STATE_PATH")
+
+
+class WorkspaceObservationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TempProject()
+        self.temp.init_git()
+        self.temp.init()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_git_invocation_disables_fsmonitor_with_empty_config_value(self) -> None:
+        project = load_project(str(self.temp.project))
+        completed = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=1,
+            stdout=b"",
+            stderr=b"",
+        )
+
+        with mock.patch("offwork.project.subprocess.run", return_value=completed) as run:
+            capture_workspace(project)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["git", "-c", "core.fsmonitor="])
+
+    def test_git_invocation_disables_optional_locks_in_copied_environment(self) -> None:
+        project = load_project(str(self.temp.project))
+        completed = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=1,
+            stdout=b"",
+            stderr=b"",
+        )
+
+        with mock.patch("offwork.project.subprocess.run", return_value=completed) as run:
+            capture_workspace(project)
+
+        keyword_arguments = run.call_args.kwargs
+        self.assertIn("env", keyword_arguments)
+        environment = keyword_arguments["env"]
+        self.assertIsNot(environment, os.environ)
+        self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+
+    def test_git_timeout_returns_structured_unavailable_snapshot(self) -> None:
+        project = load_project(str(self.temp.project))
+        timeout = subprocess.TimeoutExpired(cmd=["git"], timeout=5.0)
+
+        with mock.patch("offwork.project.subprocess.run", side_effect=timeout) as run:
+            try:
+                snapshot = capture_workspace(project)
+            except subprocess.TimeoutExpired:
+                self.fail("Git timeout escaped receipt inspection")
+
+        self.assertFalse(snapshot["reliable"])
+        self.assertEqual(snapshot["reason"], "git_timeout")
+        self.assertEqual(run.call_args.kwargs["timeout"], 5.0)
+
+    def test_descriptor_dup_failure_returns_structured_unavailable_snapshot(self) -> None:
+        project = load_project(str(self.temp.project))
+        git_results = (
+            subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=os.fsencode(str(self.temp.project)),
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=b"",
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=b"tracked.txt\0",
+                stderr=b"",
+            ),
+        )
+
+        with mock.patch("offwork.project._git", side_effect=git_results), mock.patch(
+            "offwork.project.os.dup",
+            side_effect=OSError("descriptor limit reached"),
+        ):
+            try:
+                snapshot = capture_workspace(project)
+            except OSError:
+                self.fail("descriptor duplication failure escaped workspace inspection")
+
+        self.assertFalse(snapshot["reliable"])
+        self.assertEqual(snapshot["reason"], "unsafe_workspace_path")
 
 
 if __name__ == "__main__":

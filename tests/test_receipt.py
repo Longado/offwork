@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import unittest
@@ -166,6 +167,167 @@ class FreshnessTests(unittest.TestCase):
         self.assertIn("tracked.txt", shown["workspace_freshness"]["changes"])
 
 
+class InertInspectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TempProject()
+        self.temp.init_git()
+        self.temp.init()
+        self.task = self.temp.add_task()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_capture_show_and_resume_do_not_invoke_repository_fsmonitor(self) -> None:
+        sentinel = self.temp.root / "fsmonitor-invoked"
+        monitor = self.temp.root / "fsmonitor-sentinel"
+        monitor.write_text(
+            "#!/bin/sh\n"
+            'touch "$(dirname "$0")/fsmonitor-invoked"\n',
+            encoding="utf-8",
+        )
+        monitor.chmod(0o700)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.temp.project),
+                "config",
+                "core.fsmonitor",
+                str(monitor),
+            ],
+            check=True,
+        )
+        context = self.temp.write_context(CONTEXT)
+
+        captured_result = self.temp.run(
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+        self.assertEqual(
+            captured_result.returncode,
+            0,
+            captured_result.stderr or captured_result.stdout,
+        )
+        capsule_id = self.temp.json_stdout(captured_result)["data"]["capsule"]["capsule_id"]
+        for command in (
+            ("task", "show", self.task["task_id"], "--capsule", capsule_id),
+            ("resume", "--task", self.task["task_id"], "--capsule", capsule_id),
+        ):
+            result = self.temp.run(
+                *command,
+                "--project",
+                str(self.temp.project),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+        self.assertFalse(sentinel.exists(), "receipt inspection invoked core.fsmonitor")
+
+    def test_intermediate_directory_symlink_makes_freshness_unavailable(self) -> None:
+        tracked_directory = self.temp.project / "dir"
+        tracked_directory.mkdir()
+        (tracked_directory / "file").write_text("captured\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "add", "dir/file"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "commit", "-qm", "add nested file"],
+            check=True,
+        )
+        context = self.temp.write_context(CONTEXT)
+        captured_result = self.temp.run(
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+        self.assertEqual(
+            captured_result.returncode,
+            0,
+            captured_result.stderr or captured_result.stdout,
+        )
+        captured = self.temp.json_stdout(captured_result)["data"]
+        outside_directory = self.temp.root / "outside"
+        outside_directory.mkdir()
+        (outside_directory / "file").write_text("captured\n", encoding="utf-8")
+        shutil.rmtree(tracked_directory)
+        tracked_directory.symlink_to(outside_directory, target_is_directory=True)
+
+        shown_result = self.temp.run(
+            "task",
+            "show",
+            self.task["task_id"],
+            "--capsule",
+            captured["capsule"]["capsule_id"],
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+
+        self.assertEqual(shown_result.returncode, 0, shown_result.stderr or shown_result.stdout)
+        freshness = self.temp.json_stdout(shown_result)["data"]["workspace_freshness"]
+        self.assertEqual(freshness["status"], "unavailable")
+        self.assertIn("unsafe_workspace_path", freshness["limitations"])
+
+    def test_final_component_symlink_target_remains_part_of_snapshot(self) -> None:
+        link = self.temp.project / "tracked-link"
+        link.symlink_to("first-target")
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "add", "tracked-link"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "commit", "-qm", "add symlink"],
+            check=True,
+        )
+        context = self.temp.write_context(CONTEXT)
+        captured_result = self.temp.run(
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+        self.assertEqual(
+            captured_result.returncode,
+            0,
+            captured_result.stderr or captured_result.stdout,
+        )
+        captured = self.temp.json_stdout(captured_result)["data"]
+        link.unlink()
+        link.symlink_to("second-target")
+
+        shown_result = self.temp.run(
+            "task",
+            "show",
+            self.task["task_id"],
+            "--capsule",
+            captured["capsule"]["capsule_id"],
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+
+        self.assertEqual(shown_result.returncode, 0, shown_result.stderr or shown_result.stdout)
+        freshness = self.temp.json_stdout(shown_result)["data"]["workspace_freshness"]
+        self.assertEqual(freshness["status"], "changed")
+        self.assertIn("tracked-link", freshness["changes"])
+
+
 class NestedProjectFreshnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TempProject()
@@ -215,6 +377,70 @@ class NestedProjectFreshnessTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.temp.project), "add", "outside.txt"], check=True)
         subprocess.run(["git", "-C", str(self.temp.project), "commit", "-qm", "outside only"], check=True)
         self.assertEqual(self.show_status(), "fresh")
+
+    def test_show_and_resume_do_not_update_parent_repository_index(self) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.temp.project),
+                "config",
+                "core.untrackedCache",
+                "true",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "status", "--porcelain"],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        index = self.temp.project / ".git" / "index"
+
+        commands = (
+            (
+                "task",
+                "show",
+                self.task["task_id"],
+                "--capsule",
+                self.receipt["capsule"]["capsule_id"],
+            ),
+            (
+                "resume",
+                "--task",
+                self.task["task_id"],
+                "--capsule",
+                self.receipt["capsule"]["capsule_id"],
+            ),
+        )
+        for number, command in enumerate(commands):
+            probe = self.nested / f"untracked-{number}"
+            probe.mkdir()
+            (probe / "file.txt").write_text("untracked\n", encoding="utf-8")
+            before_stat = index.stat()
+            before = (
+                index.read_bytes(),
+                before_stat.st_mtime_ns,
+                before_stat.st_size,
+                before_stat.st_ino,
+            )
+
+            result = self.temp.run(
+                *command,
+                "--project",
+                str(self.nested),
+                "--json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            after_stat = index.stat()
+            after = (
+                index.read_bytes(),
+                after_stat.st_mtime_ns,
+                after_stat.st_size,
+                after_stat.st_ino,
+            )
+            self.assertEqual(after, before)
 
 
 class HumanAcceptanceTests(unittest.TestCase):
