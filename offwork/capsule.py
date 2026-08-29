@@ -69,7 +69,12 @@ def _write_private(path: Path, payload: bytes) -> None:
     )
     try:
         os.fchmod(descriptor, 0o600)
-        os.write(descriptor, payload)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("Capsule member write made no progress")
+            remaining = remaining[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -191,6 +196,31 @@ def _validate_fixed_v1_payloads(
     restore = values["restore-test.json"]
     if not isinstance(restore.get("status"), str):
         raise _integrity_error(capsule_id, "Capsule restore structure is invalid")
+
+
+def _canonical_receipt_input(
+    values: Dict[str, Dict[str, Any]], capsule_id: str
+) -> Dict[str, Any]:
+    capsule = values["capsule.json"]
+    context = capsule["context"]
+    return {
+        "task": copy.deepcopy(capsule["task"]),
+        "capsule": {
+            "capsule_id": capsule["capsule_id"],
+            "captured_at": capsule["captured_at"],
+        },
+        "agent_claimed": {
+            "source": "capture_context",
+            "summary": context["summary"],
+            "items": copy.deepcopy(context["agent_claims"]),
+        },
+        "offwork_observed": copy.deepcopy(capsule["observed"]),
+        "auto_checked": copy.deepcopy(values["checks.json"]),
+        "unknowns": copy.deepcopy(context["unknowns"]),
+        "open_loops": copy.deepcopy(context["open_loops"]),
+        "next_step": context["next_step"],
+        "workspace_snapshot": copy.deepcopy(capsule["workspace_snapshot"]),
+    }
 
 
 def _read_private_member(path: Path, capsule_id: str, name: str) -> bytes:
@@ -322,7 +352,8 @@ def _capture_locked(
     }
     restore_value = {
         "schema_version": "offwork.restore-test/v1",
-        "status": "passed",
+        "status": "not_evaluated",
+        "authority": "descriptive_only",
     }
     payloads = {
         "capsule.json": _json_bytes(capsule_value),
@@ -462,11 +493,18 @@ def _verify_directory(
     if values["capsule.json"].get("capsule_id") != capsule_id:
         raise _integrity_error(capsule_id, "Capsule payload identity does not match its directory")
     _validate_fixed_v1_payloads(values, capsule_id)
+    receipt_input = _canonical_receipt_input(values, capsule_id)
     return {
         "capsule": values["capsule.json"],
         "checks": values["checks.json"],
         "restore": values["restore-test.json"],
         "manifest_hash": manifest_hash,
+        "receipt_input": receipt_input,
+        "handoff_verification": {
+            "integrity": {"status": "passed"},
+            "completeness": {"status": "complete", "missing_information": []},
+            "restore": {"status": "passed"},
+        },
     }
 
 

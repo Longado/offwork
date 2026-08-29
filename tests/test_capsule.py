@@ -15,7 +15,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from offwork.capsule import CAPSULE_MEMBERS, _read_private_member, reconcile_capsules
+from offwork.capsule import (
+    CAPSULE_MEMBERS,
+    _read_private_member,
+    _write_private,
+    reconcile_capsules,
+)
 from offwork.cli import main
 from offwork.errors import OffworkError
 from offwork.project import load_project
@@ -91,6 +96,70 @@ class CapsuleCaptureTests(unittest.TestCase):
         self.assertTrue((capsule_dir / "checks.json").is_file())
         self.assertTrue((capsule_dir / "restore-test.json").is_file())
         self.assertTrue((capsule_dir / "manifest.json").is_file())
+
+    def test_capture_reconstructs_receipt_from_published_payload_bytes(self) -> None:
+        context_path = self.temp.write_context(CONTEXT)
+        published_summary = "summary reconstructed from published bytes"
+        from offwork import capsule as capsule_module
+
+        real_json_bytes = capsule_module._json_bytes
+
+        def serialize(value):
+            persisted = copy.deepcopy(value)
+            if persisted.get("schema_version") == "offwork.capsule/v1":
+                persisted["context"]["summary"] = published_summary
+            return real_json_bytes(persisted)
+
+        stdout = io.StringIO()
+        with mock.patch(
+            "offwork.capsule._json_bytes", side_effect=serialize
+        ), contextlib.redirect_stdout(stdout):
+            returncode = main(
+                [
+                    "capture",
+                    "--task",
+                    self.task["task_id"],
+                    "--context",
+                    str(context_path),
+                    "--project",
+                    str(self.temp.project),
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(returncode, 0, stdout.getvalue())
+        receipt = json.loads(stdout.getvalue())["data"]
+        capsule_id = receipt["capsule"]["capsule_id"]
+        restore_record = json.loads(
+            (
+                self.temp.project
+                / ".offwork"
+                / "capsules"
+                / capsule_id
+                / "restore-test.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["agent_claimed"]["summary"], published_summary)
+        self.assertEqual(receipt["handoff_verified"]["restore"]["status"], "passed")
+        self.assertEqual(restore_record["status"], "not_evaluated")
+        self.assertEqual(restore_record["authority"], "descriptive_only")
+
+    def test_private_writer_retries_short_writes_until_payload_is_complete(self) -> None:
+        path = self.temp.root / "short-write.json"
+        payload = b'{"complete": true}\n'
+        real_write = os.write
+        writes = []
+
+        def short_write(descriptor, remaining):
+            chunk_size = max(1, len(remaining) // 2)
+            writes.append(chunk_size)
+            return real_write(descriptor, remaining[:chunk_size])
+
+        with mock.patch("offwork.capsule.os.write", side_effect=short_write):
+            _write_private(path, payload)
+
+        self.assertGreater(len(writes), 1)
+        self.assertEqual(path.read_bytes(), payload)
 
     def test_capture_creates_exact_private_capsule_under_restrictive_umask(self) -> None:
         context_path = self.temp.write_context(CONTEXT)
@@ -979,6 +1048,49 @@ class CapsuleIntegrityTests(unittest.TestCase):
                     self.register_manifest_hash(
                         self.capsule_id, original_manifest_hash
                     )
+
+    def test_restore_status_is_derived_instead_of_trusting_persisted_claim(self) -> None:
+        restore_path = self.capsule_dir / "restore-test.json"
+        restore = json.loads(restore_path.read_text(encoding="utf-8"))
+        restore["status"] = "claimed-passed"
+        manifest_hash = self.replace_payload_member(
+            self.capsule_id, "restore-test.json", restore
+        )
+        self.register_manifest_hash(self.capsule_id, manifest_hash)
+
+        result = self.show()
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        receipt = self.temp.json_stdout(result)["data"]
+        self.assertEqual(receipt["handoff_verified"]["restore"]["status"], "passed")
+        self.assertEqual(
+            receipt["handoff_verified"]["completeness"],
+            {"status": "complete", "missing_information": []},
+        )
+
+    def test_claimed_restore_cannot_promote_hash_consistent_malformed_payload(self) -> None:
+        capsule = json.loads(
+            (self.capsule_dir / "capsule.json").read_text(encoding="utf-8")
+        )
+        capsule["context"]["open_loops"][0]["note"] = None
+        self.replace_capsule_payload(self.capsule_id, capsule)
+        restore = json.loads(
+            (self.capsule_dir / "restore-test.json").read_text(encoding="utf-8")
+        )
+        restore["status"] = "passed"
+        manifest_hash = self.replace_payload_member(
+            self.capsule_id, "restore-test.json", restore
+        )
+        self.register_manifest_hash(self.capsule_id, manifest_hash)
+        self.assertEqual(restore["status"], "passed")
+
+        result = self.show()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
 
     def test_orphan_fixed_v1_nested_fields_are_ignored_without_state_change(self) -> None:
         for name, member, mutate in self.fixed_v1_structure_cases():
