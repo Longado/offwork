@@ -197,6 +197,24 @@ class StateService:
             ).fetchone()
         return row is not None
 
+    def validate_acceptance_target(self, task_id: str, capsule_id: str) -> None:
+        with self._connect() as connection:
+            capsule = connection.execute(
+                "SELECT task_id FROM capsules WHERE capsule_id = ?", (capsule_id,)
+            ).fetchone()
+        if capsule is None:
+            raise OffworkError(
+                "CAPSULE_NOT_FOUND",
+                "Capsule does not exist",
+                details={"capsule_id": capsule_id},
+            )
+        if capsule["task_id"] != task_id:
+            raise OffworkError(
+                "CAPSULE_TASK_MISMATCH",
+                "Capsule does not belong to the requested Task",
+                details={"task_id": task_id, "capsule_id": capsule_id},
+            )
+
     def record_acceptance(
         self,
         *,
@@ -205,7 +223,7 @@ class StateService:
         expected_revision: int,
         status: str,
         note: Optional[str],
-    ) -> None:
+    ) -> Dict[str, Any]:
         if status not in {"accepted", "rejected"}:
             raise ValueError("invalid acceptance status")
         acted_at = utc_now()
@@ -259,6 +277,12 @@ class StateService:
                     acted_at,
                 ),
             )
+        return {
+            "status": status,
+            "acted_at": acted_at,
+            "note": note,
+            "task_revision": new_revision,
+        }
 
     def get_acceptance(self, capsule_id: str) -> Dict[str, Any]:
         with self._connect() as connection:

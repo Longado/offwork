@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import unittest
+import json
+import sqlite3
 import subprocess
+import unittest
 
 from tests.helpers import TempProject
 from tests.test_capsule import CONTEXT
@@ -248,6 +250,22 @@ class HumanAcceptanceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return self.temp.json_stdout(result)["data"]
 
+    def stored_acceptance_state(self) -> tuple[int, int, str]:
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        with sqlite3.connect(str(database)) as connection:
+            revision = connection.execute(
+                "SELECT revision FROM tasks WHERE task_id = ?", (self.task["task_id"],)
+            ).fetchone()[0]
+            events = connection.execute(
+                """
+                SELECT status FROM human_acceptance_events
+                WHERE capsule_id = ? ORDER BY task_revision
+                """,
+                (self.capsule_id,),
+            ).fetchall()
+        current = events[-1][0] if events else "pending"
+        return revision, len(events), current
+
     def test_successful_check_does_not_accept_capsule(self) -> None:
         self.assertEqual(self.receipt["auto_checked"]["status"], "passed")
         self.assertEqual(self.receipt["human_acceptance"]["status"], "pending")
@@ -304,6 +322,40 @@ class HumanAcceptanceTests(unittest.TestCase):
         self.assertEqual(
             self.temp.json_stdout(result)["error"]["code"], "CAPSULE_TASK_MISMATCH"
         )
+
+    def test_accept_tampered_manifest_changes_no_acceptance_state(self) -> None:
+        before = self.stored_acceptance_state()
+        manifest = (
+            self.temp.project / ".offwork" / "capsules" / self.capsule_id / "manifest.json"
+        )
+        manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+        result = self.decide("accept", self.receipt["task"]["current_revision"])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+        self.assertEqual(self.stored_acceptance_state(), before)
+
+    def test_reject_tampered_payload_changes_no_acceptance_state(self) -> None:
+        before = self.stored_acceptance_state()
+        payload = (
+            self.temp.project / ".offwork" / "capsules" / self.capsule_id / "capsule.json"
+        )
+        value = json.loads(payload.read_text(encoding="utf-8"))
+        value["context"]["summary"] = "tampered"
+        payload.write_text(json.dumps(value), encoding="utf-8")
+
+        result = self.decide("reject", self.receipt["task"]["current_revision"])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"],
+            "CAPSULE_INTEGRITY_FAILED",
+        )
+        self.assertEqual(self.stored_acceptance_state(), before)
 
 if __name__ == "__main__":
     unittest.main()

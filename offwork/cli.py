@@ -129,14 +129,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if arguments.command == "task" and arguments.task_command in {"accept", "reject"}:
             project = load_project(arguments.project)
-            StateService(project["state_dir"]).record_acceptance(
+            state = StateService(project["state_dir"])
+            state.validate_acceptance_target(arguments.task_id, arguments.capsule)
+            receipt = build_receipt(project, arguments.task_id, arguments.capsule)
+            acceptance = state.record_acceptance(
                 task_id=arguments.task_id,
                 capsule_id=arguments.capsule,
                 expected_revision=arguments.if_revision,
                 status="accepted" if arguments.task_command == "accept" else "rejected",
                 note=arguments.note,
             )
-            receipt = build_receipt(project, arguments.task_id, arguments.capsule)
+            receipt["task"]["current_revision"] = acceptance["task_revision"]
+            receipt["human_acceptance"] = {
+                "status": acceptance["status"],
+                "acted_at": acceptance["acted_at"],
+                "note": acceptance["note"],
+            }
             command = f"task.{arguments.task_command}"
             if arguments.json_output:
                 write_json(success_envelope(command, receipt))
