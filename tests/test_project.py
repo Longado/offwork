@@ -582,6 +582,36 @@ class WorkspaceObservationTests(unittest.TestCase):
         self.assertEqual(freshness["status"], "unavailable")
         self.assertIn("git_boundary_changed", freshness["limitations"])
 
+    def test_parent_only_git_metadata_change_during_nested_scan_is_stable(self) -> None:
+        project = {
+            "project_id": "project-nested-metadata",
+            "project_path": "/parent/nested",
+        }
+        first = {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": True,
+            **project,
+            "git_root": "/parent",
+            "project_is_git_root": False,
+            "branch": "before",
+            "head": "head-before",
+            "entries": {"tracked.txt": {"sha256": "unchanged"}},
+            "changed_paths": [],
+            "_git_scan_fingerprint": "unchanged-index",
+        }
+        second = {**first, "branch": "after", "head": "head-after"}
+
+        with mock.patch(
+            "offwork.project._capture_workspace_once",
+            side_effect=(first, second),
+        ):
+            snapshot = capture_workspace(project)
+
+        self.assertTrue(snapshot["reliable"])
+        self.assertFalse(snapshot["project_is_git_root"])
+        self.assertEqual(snapshot["branch"], "after")
+        self.assertEqual(snapshot["head"], "head-after")
+
     def test_change_during_scan_cannot_return_false_fresh(self) -> None:
         project = load_project(str(self.temp.project))
         captured = capture_workspace(project)

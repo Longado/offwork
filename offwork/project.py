@@ -425,7 +425,13 @@ def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
     second = _capture_workspace_once(project)
     if not second.get("reliable"):
         return second
-    if first != second:
+    first_stability = dict(first)
+    second_stability = dict(second)
+    if not first.get("project_is_git_root") and not second.get("project_is_git_root"):
+        for metadata in (first_stability, second_stability):
+            metadata.pop("branch", None)
+            metadata.pop("head", None)
+    if first_stability != second_stability:
         return {
             "schema_version": "offwork.workspace/v1",
             "reliable": False,
