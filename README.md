@@ -17,6 +17,12 @@ Offwork is a Python 3.9+ standard-library CLI. It requires system Git and has no
 
 The Loop 6 clean-clone proof was run on macOS 26.4.1 arm64 with Python 3.9.6 and Apple Git 2.50.1. The CLI targets POSIX process behavior; Linux is intended but was not independently verified in that run, and Windows support is not claimed.
 
+## Prototype status
+
+The technical MVP was explicitly accepted by the human PM and merged into `main` through [PR #2](https://github.com/Longado/offwork/pull/2) on 2026-08-29. A post-merge clean clone at `e60171d` passed all 146 standard-library tests, `compileall`, `git diff --check`, help, and version checks.
+
+This status means the local handoff and recovery mechanism is ready for review and use as a prototype. It does not mean a tag or GitHub release was created, or that deployment, customer acceptance, Linux/Windows support, external identity, or compliance was verified. The human decision and current limits remain recorded in [PM_REVIEW.md](./PM_REVIEW.md).
+
 ## Run without installing
 
 From any directory, invoke the repository launcher by absolute path:
