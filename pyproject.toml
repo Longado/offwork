@@ -1,0 +1,8 @@
+[project]
+name = "offwork"
+version = "1.0.0"
+requires-python = ">=3.9"
+
+[project.scripts]
+offwork = "offwork.cli:main"
+

@@ -4,6 +4,8 @@
 
 **Product contract:** [`PRD_V1.0.md`](./PRD_V1.0.md) is authoritative for product behavior and terminology. This plan defines implementation order only; it must not silently change the PRD.
 
+**Evolution sequence:** [`EVOLUTION_PLAN.md`](./EVOLUTION_PLAN.md) defines the approved loop order, expected user-visible effect, evidence, progress commits, and human PM gate for each iteration.
+
 **Goal:** Build a five-minute, zero-install prototype that proves a history-free Agent can inspect a structured Handoff Receipt, detect whether the explicit Git project changed after capture, and safely choose the correct first step.
 
 **Architecture:** Offwork is a local-first Python CLI. Each project owns a private SQLite database and immutable Capsule directories under `.offwork/`. A Receipt is a derived view over immutable capture evidence, persisted check results, current project freshness, and explicit Capsule-level human acceptance. It is not a workflow engine.
@@ -22,6 +24,19 @@ Before each implementation task:
 4. record the real result rather than assuming an earlier task is complete.
 
 Do not copy source or tests from `offwork-capsule`. It may be read only as historical reference.
+
+### 1.1 Permanent human PM review lane
+
+Every product milestone keeps a visible human PM review checkpoint in [`PM_REVIEW.md`](./PM_REVIEW.md).
+
+- the checkpoint defaults to `pending`;
+- only an explicit decision from the user or a named human PM may set `accepted`, `rejected`, or `changes_requested`;
+- an Agent or reviewer may prepare evidence, risks, and a recommendation, but may not impersonate the human reviewer or change the human decision;
+- tests passing, a demo succeeding, a commit, a push, or a multi-Agent review never implies PM acceptance;
+- scope changes, milestone completion, merge readiness, and release claims must show the current human PM status;
+- Capsule-level `human_acceptance` remains a runtime handoff fact and is separate from product-development PM review.
+
+Development may use multiple small, reviewable Git commits. Each progress commit must represent one coherent change, preserve a green or explicitly documented baseline, and be pushed to the feature branch when sharing progress. A progress commit is evidence for review, not approval.
 
 ## 2. Prototype proof
 
@@ -368,6 +383,7 @@ Return `unavailable` for unreadable required paths, unstable concurrent scans, u
 - [ ] Full standard-library tests and compileall pass.
 - [ ] The temporary-project demo completes within five minutes.
 - [ ] A history-free Agent makes the expected first decision from Receipt alone.
+- [ ] The current milestone has an explicit human PM decision recorded in `PM_REVIEW.md`.
 
 ## 12. Stop conditions
 
@@ -380,5 +396,6 @@ Stop and request authorization before:
 - rewriting an existing Capsule;
 - treating an automatic result as human, customer, deployment, or production acceptance;
 - adding Automation Opportunity, Shell history analysis, aliases, or workflow execution.
+- claiming a milestone accepted, merge-ready, or released while its human PM review is still `pending` or `changes_requested`.
 
 The prototype succeeds when the five-minute storyline works honestly. It does not need to prove market demand, pass a fourteen-day validation gate, or become a general Agent platform.
