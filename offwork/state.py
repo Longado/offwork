@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from offwork.errors import OffworkError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -37,6 +37,19 @@ def initialize_database(path: Path) -> None:
                 current_capsule_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_acceptance_events (
+                event_id TEXT PRIMARY KEY,
+                capsule_id TEXT NOT NULL REFERENCES capsules(capsule_id),
+                status TEXT NOT NULL CHECK(status IN ('accepted', 'rejected')),
+                note TEXT,
+                task_revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(capsule_id, task_revision)
             )
             """
         )
@@ -183,3 +196,86 @@ class StateService:
                 "SELECT 1 FROM capsules WHERE capsule_id = ?", (capsule_id,)
             ).fetchone()
         return row is not None
+
+    def record_acceptance(
+        self,
+        *,
+        task_id: str,
+        capsule_id: str,
+        expected_revision: int,
+        status: str,
+        note: Optional[str],
+    ) -> None:
+        if status not in {"accepted", "rejected"}:
+            raise ValueError("invalid acceptance status")
+        acted_at = utc_now()
+        new_revision = expected_revision + 1
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            capsule = connection.execute(
+                "SELECT task_id FROM capsules WHERE capsule_id = ?", (capsule_id,)
+            ).fetchone()
+            if capsule is None:
+                raise OffworkError(
+                    "CAPSULE_NOT_FOUND",
+                    "Capsule does not exist",
+                    details={"capsule_id": capsule_id},
+                )
+            if capsule["task_id"] != task_id:
+                raise OffworkError(
+                    "CAPSULE_TASK_MISMATCH",
+                    "Capsule does not belong to the requested Task",
+                    details={"task_id": task_id, "capsule_id": capsule_id},
+                )
+            changed = connection.execute(
+                """
+                UPDATE tasks SET revision = ?, updated_at = ?
+                WHERE task_id = ? AND revision = ?
+                """,
+                (new_revision, acted_at, task_id, expected_revision),
+            ).rowcount
+            if changed != 1:
+                raise OffworkError(
+                    "TASK_REVISION_CONFLICT",
+                    "Task revision changed; review the current Receipt before deciding",
+                    details={
+                        "task_id": task_id,
+                        "capsule_id": capsule_id,
+                        "expected_revision": expected_revision,
+                    },
+                )
+            connection.execute(
+                """
+                INSERT INTO human_acceptance_events (
+                    event_id, capsule_id, status, note, task_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"acceptance-{uuid.uuid4().hex}",
+                    capsule_id,
+                    status,
+                    note,
+                    new_revision,
+                    acted_at,
+                ),
+            )
+
+    def get_acceptance(self, capsule_id: str) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status, note, created_at, task_revision
+                FROM human_acceptance_events
+                WHERE capsule_id = ?
+                ORDER BY task_revision DESC
+                LIMIT 1
+                """,
+                (capsule_id,),
+            ).fetchone()
+        if row is None:
+            return {"status": "pending", "acted_at": None, "note": None}
+        return {
+            "status": row["status"],
+            "acted_at": row["created_at"],
+            "note": row["note"],
+        }

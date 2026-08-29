@@ -215,5 +215,95 @@ class NestedProjectFreshnessTests(unittest.TestCase):
         self.assertEqual(self.show_status(), "fresh")
 
 
+class HumanAcceptanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TempProject()
+        self.temp.init_git()
+        self.temp.init()
+        self.task = self.temp.add_task(checks=["git status --short"])
+        context = self.temp.write_context(CONTEXT)
+        result = self.temp.run(
+            "capture", "--task", self.task["task_id"], "--context", str(context),
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.receipt = self.temp.json_stdout(result)["data"]
+        self.capsule_id = self.receipt["capsule"]["capsule_id"]
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def decide(self, action: str, revision: int, note: str = "reviewed"):
+        return self.temp.run(
+            "task", action, self.task["task_id"], "--capsule", self.capsule_id,
+            "--if-revision", str(revision), "--note", note,
+            "--project", str(self.temp.project), "--json"
+        )
+
+    def show(self) -> dict:
+        result = self.temp.run(
+            "task", "show", self.task["task_id"], "--capsule", self.capsule_id,
+            "--project", str(self.temp.project), "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        return self.temp.json_stdout(result)["data"]
+
+    def test_successful_check_does_not_accept_capsule(self) -> None:
+        self.assertEqual(self.receipt["auto_checked"]["status"], "passed")
+        self.assertEqual(self.receipt["human_acceptance"]["status"], "pending")
+
+    def test_explicit_accept_records_time_note_and_revision(self) -> None:
+        result = self.decide("accept", self.receipt["task"]["current_revision"], "looks good")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        receipt = self.temp.json_stdout(result)["data"]
+        self.assertEqual(receipt["human_acceptance"]["status"], "accepted")
+        self.assertEqual(receipt["human_acceptance"]["note"], "looks good")
+        self.assertIsNotNone(receipt["human_acceptance"]["acted_at"])
+        self.assertEqual(receipt["task"]["current_revision"], 3)
+
+    def test_explicit_reject_records_rejected(self) -> None:
+        result = self.decide("reject", self.receipt["task"]["current_revision"], "needs work")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            self.temp.json_stdout(result)["data"]["human_acceptance"]["status"],
+            "rejected",
+        )
+
+    def test_stale_revision_changes_nothing(self) -> None:
+        accepted = self.decide("accept", self.receipt["task"]["current_revision"])
+        self.assertEqual(accepted.returncode, 0, accepted.stderr or accepted.stdout)
+
+        stale = self.decide("reject", self.receipt["task"]["current_revision"])
+
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(stale)["error"]["code"], "TASK_REVISION_CONFLICT"
+        )
+        self.assertEqual(self.show()["human_acceptance"]["status"], "accepted")
+
+    def test_later_explicit_decision_can_replace_current_status(self) -> None:
+        accepted = self.decide("accept", self.receipt["task"]["current_revision"])
+        accepted_receipt = self.temp.json_stdout(accepted)["data"]
+        rejected = self.decide("reject", accepted_receipt["task"]["current_revision"])
+
+        self.assertEqual(rejected.returncode, 0, rejected.stderr or rejected.stdout)
+        receipt = self.temp.json_stdout(rejected)["data"]
+        self.assertEqual(receipt["human_acceptance"]["status"], "rejected")
+        self.assertEqual(receipt["task"]["current_revision"], 4)
+
+    def test_capsule_from_another_task_is_rejected(self) -> None:
+        other = self.temp.add_task(title="other", goal="other goal")
+        result = self.temp.run(
+            "task", "accept", other["task_id"], "--capsule", self.capsule_id,
+            "--if-revision", str(other["revision"]), "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            self.temp.json_stdout(result)["error"]["code"], "CAPSULE_TASK_MISMATCH"
+        )
+
 if __name__ == "__main__":
     unittest.main()

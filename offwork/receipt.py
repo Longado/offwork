@@ -58,5 +58,5 @@ def build_receipt(
             "changes": comparison["changes"],
             "limitations": comparison["limitations"],
         },
-        "human_acceptance": {"status": "pending", "acted_at": None, "note": None},
+        "human_acceptance": state.get_acceptance(capsule["capsule_id"]),
     }

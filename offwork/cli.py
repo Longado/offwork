@@ -38,6 +38,16 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("--capsule")
     show_parser.add_argument("--project", required=True)
     show_parser.add_argument("--json", action="store_true", dest="json_output")
+    for action in ("accept", "reject"):
+        decision_parser = task_subparsers.add_parser(
+            action, help=f"{action} a specific Capsule handoff"
+        )
+        decision_parser.add_argument("task_id")
+        decision_parser.add_argument("--capsule", required=True)
+        decision_parser.add_argument("--if-revision", required=True, type=int)
+        decision_parser.add_argument("--note")
+        decision_parser.add_argument("--project", required=True)
+        decision_parser.add_argument("--json", action="store_true", dest="json_output")
 
     capture_parser = subparsers.add_parser("capture", help="capture a handoff Capsule")
     capture_parser.add_argument("--task", required=True, dest="task_id")
@@ -102,6 +112,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             receipt = build_receipt(project, arguments.task_id, arguments.capsule)
             if arguments.json_output:
                 write_json(success_envelope("task.show", receipt))
+            else:
+                print(render_receipt(receipt), end="")
+            return 0
+        if arguments.command == "task" and arguments.task_command in {"accept", "reject"}:
+            project = load_project(arguments.project)
+            StateService(project["state_dir"]).record_acceptance(
+                task_id=arguments.task_id,
+                capsule_id=arguments.capsule,
+                expected_revision=arguments.if_revision,
+                status="accepted" if arguments.task_command == "accept" else "rejected",
+                note=arguments.note,
+            )
+            receipt = build_receipt(project, arguments.task_id, arguments.capsule)
+            command = f"task.{arguments.task_command}"
+            if arguments.json_output:
+                write_json(success_envelope(command, receipt))
             else:
                 print(render_receipt(receipt), end="")
             return 0
