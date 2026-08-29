@@ -159,6 +159,102 @@ class CheckRunnerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "UNSAFE_CHECK_ARGUMENT")
         self.assertFalse(marker.exists())
 
+    def test_malformed_secret_command_is_rejected_before_any_check_starts(self) -> None:
+        marker = self.project / "executed"
+        first = python_command(
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+            str(marker),
+        )
+        malformed_cases = [
+            "/usr/bin/true --TOKEN='secret",
+            "/usr/bin/true -H 'Authorization: Bearer path/secret",
+            "/usr/bin/true 'https://alice:secret@example.test/check",
+        ]
+
+        for malformed in malformed_cases:
+            with self.subTest(command=malformed):
+                marker.unlink(missing_ok=True)
+                with self.assertRaises(OffworkError) as raised:
+                    checks.run_checks([first, malformed], self.project)
+                self.assertEqual(raised.exception.code, "UNSAFE_CHECK_ARGUMENT")
+                self.assertFalse(marker.exists())
+
+    def test_authorization_header_with_slash_is_rejected_before_execution(self) -> None:
+        marker = self.project / "executed"
+        source = "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')"
+        cases = [
+            ["Authorization: Bearer path/secret"],
+            ["-HAuthorization: Bearer path/secret"],
+            ["--header=Authorization: Bearer path/secret"],
+        ]
+
+        for suffix in cases:
+            with self.subTest(argv=suffix):
+                marker.unlink(missing_ok=True)
+                command = shlex.join(
+                    [sys.executable, "-c", source, str(marker), *suffix]
+                )
+                with self.assertRaises(OffworkError) as raised:
+                    checks.run_checks([command], self.project)
+                self.assertEqual(raised.exception.code, "UNSAFE_CHECK_ARGUMENT")
+                self.assertFalse(marker.exists())
+
+    def test_authorization_named_path_is_not_treated_as_a_header(self) -> None:
+        argument = "/tmp/Authorization:notes/path"
+        command = python_command(
+            "import pathlib,sys; pathlib.Path('argument.txt').write_text(sys.argv[1])",
+            argument,
+        )
+
+        result = checks.run_checks([command], self.project)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual((self.project / "argument.txt").read_text(), argument)
+
+    def _assert_exception_terminates_descendant(
+        self, interruption: BaseException, label: str
+    ) -> None:
+        ready = self.project / f"{label}-ready"
+        marker = self.project / f"{label}-late-mutation"
+        child = (
+            "import pathlib,time; "
+            "time.sleep(0.10); "
+            f"pathlib.Path({str(marker)!r}).write_text('mutated'); "
+            "time.sleep(0.20)"
+        )
+        parent = (
+            "import pathlib,subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+            f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+            "time.sleep(5)"
+        )
+        original_drain = checks._drain_ready_streams
+        raised = False
+
+        def interrupt_once(selector: object, buffers: object, wait: float) -> None:
+            nonlocal raised
+            original_drain(selector, buffers, min(wait, 0.01))
+            if ready.exists() and not raised:
+                raised = True
+                raise interruption
+
+        with mock.patch.object(
+            checks, "_drain_ready_streams", side_effect=interrupt_once
+        ), self.assertRaises(type(interruption)):
+            checks.run_checks([python_command(parent)], self.project)
+        time.sleep(0.60)
+
+        self.assertTrue(raised)
+        self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "process-group checks require POSIX")
+    def test_runtime_exception_terminates_descendant_process_group(self) -> None:
+        self._assert_exception_terminates_descendant(RuntimeError("interrupted"), "error")
+
+    @unittest.skipUnless(os.name == "posix", "process-group checks require POSIX")
+    def test_keyboard_interrupt_terminates_descendant_process_group(self) -> None:
+        self._assert_exception_terminates_descendant(KeyboardInterrupt(), "keyboard")
+
     def test_local_wrapper_path_remains_allowed(self) -> None:
         wrapper = self.project / "bin" / "token-wrapper"
         wrapper.parent.mkdir()

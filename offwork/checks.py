@@ -22,14 +22,54 @@ MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024
 OUTPUT_READ_BYTES = 64 * 1024
 
 _SECRET_OPTIONS = ("--password", "--token", "--api-key")
-_AUTHORIZATION_ARGUMENT = re.compile(
-    r"authorization(?:$|[\s=:,])",
+_AUTHORIZATION_HEADER = re.compile(
+    r"^authorization(?:\s*[:=]|\s*$)",
     re.IGNORECASE,
 )
 _URL_USER_INFO = re.compile(
     r"(?:^|=)[a-z][a-z0-9+.-]*://[^/@\s]+@",
     re.IGNORECASE,
 )
+_RAW_SECRET_OPTION = re.compile(
+    r"(?:^|[\s\"'])--(?:password|token|api-key)(?:=|[\s\"']|$)",
+    re.IGNORECASE,
+)
+_RAW_AUTHORIZATION_HEADER = re.compile(
+    r"(?:^|\s)(?:-h\s*=?\s*|--header(?:=|\s+))?[\"']?"
+    r"authorization(?:\s*[:=]|\s*(?:[\"']|$))",
+    re.IGNORECASE,
+)
+_RAW_URL_USER_INFO = re.compile(
+    r"[a-z][a-z0-9+.-]*://[^/\s\"']+@",
+    re.IGNORECASE,
+)
+
+
+def _raise_unsafe_check_argument(**details: int) -> None:
+    raise OffworkError(
+        "UNSAFE_CHECK_ARGUMENT",
+        "Check arguments must not contain credentials",
+        details=details,
+    )
+
+
+def _is_authorization_header(argument: str) -> bool:
+    candidate = argument.strip()
+    folded = candidate.casefold()
+    if folded.startswith("--header="):
+        candidate = candidate[len("--header=") :].lstrip()
+    elif folded.startswith("-h") and not folded.startswith("--"):
+        candidate = candidate[2:].lstrip("= \t")
+    return _AUTHORIZATION_HEADER.match(candidate) is not None
+
+
+def _validate_malformed_command(command: str, command_index: int) -> None:
+    if (
+        _RAW_SECRET_OPTION.search(command) is not None
+        or _RAW_AUTHORIZATION_HEADER.search(command) is not None
+        or _RAW_URL_USER_INFO.search(command) is not None
+    ):
+        _raise_unsafe_check_argument(command_index=command_index)
 
 
 def _validate_argv(argv: List[str]) -> None:
@@ -39,20 +79,9 @@ def _validate_argv(argv: List[str]) -> None:
             folded == option or folded.startswith(f"{option}=")
             for option in _SECRET_OPTIONS
         ):
-            raise OffworkError(
-                "UNSAFE_CHECK_ARGUMENT",
-                "Check arguments must not contain credentials",
-                details={"argument_index": index},
-            )
-        if (
-            "/" not in argument
-            and _AUTHORIZATION_ARGUMENT.search(argument) is not None
-        ) or _URL_USER_INFO.search(argument) is not None:
-            raise OffworkError(
-                "UNSAFE_CHECK_ARGUMENT",
-                "Check arguments must not contain credentials",
-                details={"argument_index": index},
-            )
+            _raise_unsafe_check_argument(argument_index=index)
+        if _is_authorization_header(argument) or _URL_USER_INFO.search(argument):
+            _raise_unsafe_check_argument(argument_index=index)
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -156,6 +185,7 @@ def _terminate_group(
 def _run_check(
     argv: List[str], canonical_project: Path, deadline: float
 ) -> tuple[str, int | None]:
+    selector = selectors.DefaultSelector()
     try:
         process = subprocess.Popen(
             argv,
@@ -167,9 +197,12 @@ def _run_check(
             start_new_session=True,
         )
     except OSError:
+        selector.close()
         return "unavailable", None
+    except BaseException:
+        selector.close()
+        raise
 
-    selector = selectors.DefaultSelector()
     buffers: Dict[int, bytearray] = {}
     streams = (process.stdout, process.stderr)
     try:
@@ -187,14 +220,17 @@ def _run_check(
             ("passed" if process.returncode == 0 else "failed"),
             process.returncode,
         )
+    except BaseException:
+        _terminate_group(process, selector, buffers)
+        raise
     finally:
         for stream in streams:
             if stream is not None:
                 _close_stream(selector, stream)
         selector.close()
-        if process.poll() is None:
+        if process.poll() is None or _process_group_exists(process.pid):
+            _signal_process_group(process.pid, signal.SIGKILL)
             try:
-                process.kill()
                 process.wait(timeout=CHECK_KILL_GRACE_SECONDS)
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -209,12 +245,13 @@ def run_checks(commands: List[str], project: Path) -> Dict[str, Any]:
         }
 
     parsed_commands: List[List[str]] = []
-    for command in commands:
+    for command_index, command in enumerate(commands):
         try:
             argv = shlex.split(command)
             if not argv:
                 raise ValueError("empty argv")
         except ValueError:
+            _validate_malformed_command(command, command_index)
             argv = []
         else:
             _validate_argv(argv)
