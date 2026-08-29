@@ -13,11 +13,11 @@ This file keeps the human product decision visible throughout development. It is
 
 ## Current checkpoint
 
-- Milestone: Loops 1–6 — Continuous prototype execution
+- Milestone: Loop 2 — Evidence consistency execution
 - Human PM reviewer: user
 - Status: `pending`
 - Opened: 2026-08-29
-- Decision requested: review loop evidence as it is produced; execution may continue through Loop 6, but completion, merge, tag, and release remain pending explicit human decisions
+- Decision requested: review Loop 1 technical evidence when convenient; continuous implementation proceeds through Loop 6, while completion, merge, tag, and release remain pending explicit human decisions
 
 ### Evidence prepared for review
 
@@ -26,6 +26,9 @@ This file keeps the human product decision visible throughout development. It is
 - Automated baseline: `python3 -m unittest discover -v` passed 37 tests on 2026-08-29
 - Multi-Agent product and implementation review: completed; no files changed during review
 - Evolution plan: Loops 0–6 define one product question, expected user-visible effect, evidence, commits, and PM gate per iteration
+- Loop 1 technical result: final integrated review found no remaining Critical/Important Loop 1 issue; 91 standard-library tests, compileall, and diff check passed at `3400cf8`
+- Loop 1 progress commits: `ab9b2d4`, `94bb8f4`, `483b454`, `ced9380`, and `3400cf8`, all pushed to GitHub
+- Loop 1 human PM completion decision: not yet recorded
 - Highest-priority findings:
   1. acceptance can be persisted before Capsule integrity failure is returned;
   2. fixed state paths and workspace scanning have symlink boundary risks;
