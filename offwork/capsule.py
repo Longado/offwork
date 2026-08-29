@@ -12,7 +12,12 @@ from typing import Any, Dict
 from offwork.errors import OffworkError
 from offwork.checks import run_checks
 from offwork.project import capture_workspace
-from offwork.state import StateService, utc_now
+from offwork.state import (
+    StateService,
+    create_private_directory,
+    utc_now,
+    validate_private_path,
+)
 
 
 PAYLOAD_NAMES = ("capsule.json", "checks.json", "restore-test.json")
@@ -24,8 +29,13 @@ def _json_bytes(value: Dict[str, Any]) -> bytes:
 
 
 def _write_private(path: Path, payload: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
     try:
+        os.fchmod(descriptor, 0o600)
         os.write(descriptor, payload)
         os.fsync(descriptor)
     finally:
@@ -50,6 +60,38 @@ def _integrity_error(capsule_id: str, message: str) -> OffworkError:
             "freshness": "not_evaluated",
         },
     )
+
+
+def _read_private_member(path: Path, capsule_id: str, name: str) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise _integrity_error(
+            capsule_id, f"Capsule member {name} cannot be opened safely"
+        ) from exc
+    try:
+        current = os.fstat(descriptor)
+        if not stat.S_ISREG(current.st_mode):
+            raise _integrity_error(
+                capsule_id, f"Capsule member {name} is not a regular file"
+            )
+        if current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600:
+            raise _integrity_error(
+                capsule_id, f"Capsule member {name} permissions are unsafe"
+            )
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    except OSError as exc:
+        raise _integrity_error(capsule_id, f"Capsule member {name} cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _cleanup_staging(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
 
 
 def load_context(path: str) -> Dict[str, Any]:
@@ -134,9 +176,14 @@ def capture(
     manifest_payload = _json_bytes(manifest_value)
 
     capsules_dir = project["state_dir"] / "capsules"
+    validate_private_path(
+        capsules_dir,
+        expected_type="directory",
+        expected_mode=0o700,
+    )
     staging = capsules_dir / f".staging-{uuid.uuid4().hex}"
     final = capsules_dir / capsule_id
-    staging.mkdir(mode=0o700)
+    create_private_directory(staging)
     try:
         for name, payload in payloads.items():
             _write_private(staging / name, payload)
@@ -144,9 +191,18 @@ def capture(
         _fsync_directory(staging)
         os.rename(staging, final)
         _fsync_directory(capsules_dir)
+    except OffworkError:
+        _cleanup_staging(staging)
+        raise
+    except OSError as exc:
+        _cleanup_staging(staging)
+        raise OffworkError(
+            "CAPSULE_PUBLICATION_FAILED",
+            "Capsule could not be published safely",
+            details={"path": str(staging)},
+        ) from exc
     except Exception:
-        if staging.exists():
-            shutil.rmtree(staging)
+        _cleanup_staging(staging)
         raise
 
     state.register_capsule(
@@ -166,11 +222,13 @@ def _validated_archive_path(state_dir: Path, archive_path: str, capsule_id: str)
         raise _integrity_error(capsule_id, "Capsule archive path is invalid")
     directory = state_dir / relative
     try:
-        directory_mode = directory.lstat().st_mode
+        directory_stat = directory.lstat()
     except OSError as exc:
         raise _integrity_error(capsule_id, "Capsule directory is missing") from exc
-    if not stat.S_ISDIR(directory_mode) or stat.S_ISLNK(directory_mode):
+    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
         raise _integrity_error(capsule_id, "Capsule directory must be a real directory")
+    if directory_stat.st_uid != os.getuid() or stat.S_IMODE(directory_stat.st_mode) != 0o700:
+        raise _integrity_error(capsule_id, "Capsule directory permissions are unsafe")
     return directory
 
 
@@ -187,16 +245,7 @@ def _verify_directory(
     payload_bytes: Dict[str, bytes] = {}
     for name in CAPSULE_MEMBERS:
         path = directory / name
-        try:
-            mode = path.lstat().st_mode
-        except OSError as exc:
-            raise _integrity_error(capsule_id, f"Capsule member {name} is missing") from exc
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-            raise _integrity_error(capsule_id, f"Capsule member {name} is not a regular file")
-        try:
-            payload_bytes[name] = path.read_bytes()
-        except OSError as exc:
-            raise _integrity_error(capsule_id, f"Capsule member {name} cannot be read") from exc
+        payload_bytes[name] = _read_private_member(path, capsule_id, name)
 
     manifest_payload = payload_bytes["manifest.json"]
     manifest_hash = hashlib.sha256(manifest_payload).hexdigest()

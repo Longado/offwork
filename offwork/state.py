@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import json
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,19 +13,165 @@ from offwork.errors import OffworkError
 
 
 SCHEMA_VERSION = 3
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIRECTORY_MODE = 0o700
+SQLITE_AUXILIARY_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def validate_private_path(
+    path: Path,
+    *,
+    expected_type: str,
+    expected_mode: int,
+    required: bool = True,
+) -> os.stat_result | None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Required Offwork state path is missing",
+            details={"path": str(path)},
+        )
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork state path cannot be inspected safely",
+            details={"path": str(path)},
+        ) from exc
+
+    type_matches = (
+        stat.S_ISDIR(current.st_mode)
+        if expected_type == "directory"
+        else stat.S_ISREG(current.st_mode)
+    )
+    if (
+        not type_matches
+        or stat.S_ISLNK(current.st_mode)
+        or current.st_uid != os.getuid()
+        or stat.S_IMODE(current.st_mode) != expected_mode
+    ):
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Existing Offwork state path has unsafe type, owner, or permissions",
+            details={"path": str(path)},
+        )
+    return current
+
+
+def validate_database_paths(path: Path, *, required: bool = True) -> None:
+    validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=required,
+    )
+    for suffix in SQLITE_AUXILIARY_SUFFIXES:
+        validate_private_path(
+            Path(f"{path}{suffix}"),
+            expected_type="file",
+            expected_mode=PRIVATE_FILE_MODE,
+            required=False,
+        )
+
+
+def create_private_directory(
+    path: Path,
+    mode: int = PRIVATE_DIRECTORY_MODE,
+) -> None:
+    try:
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Private directory parent could not be opened safely",
+            details={"path": str(path)},
+        ) from exc
+
+    created = False
+    try:
+        os.mkdir(path.name, mode=mode, dir_fd=parent_descriptor)
+        created = True
+        os.chmod(
+            path.name,
+            mode,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+
+        directory_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            current = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_uid != os.getuid()
+                or stat.S_IMODE(current.st_mode) != mode
+            ):
+                raise OffworkError(
+                    "UNSAFE_STATE_PATH",
+                    "New private directory has unsafe owner or permissions",
+                    details={"path": str(path)},
+                )
+        finally:
+            os.close(directory_descriptor)
+    except (OSError, OffworkError) as exc:
+        if created:
+            try:
+                os.rmdir(path.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        if isinstance(exc, OffworkError):
+            raise
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Private directory could not be created safely",
+            details={"path": str(path)},
+        ) from exc
+    finally:
+        os.close(parent_descriptor)
 
 
 def connect(path: Path) -> sqlite3.Connection:
+    validate_database_paths(path)
     connection = sqlite3.connect(str(path))
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
 def initialize_database(path: Path) -> None:
-    if not path.exists():
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(descriptor)
-    os.chmod(path, 0o600)
+    existing = validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if existing is None:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                PRIVATE_FILE_MODE,
+            )
+        except OSError as exc:
+            raise OffworkError(
+                "UNSAFE_STATE_PATH",
+                "Offwork database could not be created safely",
+                details={"path": str(path)},
+            ) from exc
+        try:
+            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+        finally:
+            os.close(descriptor)
+    validate_database_paths(path)
     with connect(path) as connection:
         connection.execute(
             """
@@ -66,6 +213,7 @@ def initialize_database(path: Path) -> None:
             """
         )
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    validate_database_paths(path)
 
 
 def utc_now() -> str:

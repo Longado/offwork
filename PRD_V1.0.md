@@ -540,11 +540,12 @@ Capsule 发布遵循：
 
 ### 16.2 权限与路径
 
-- `.offwork/` 和 Capsule 目录创建为 `0700`；
-- state、JSON、manifest、SQLite 辅助文件、staging 和锁文件创建为 `0600`；
+- `.offwork/`、`capsules/`、staging 和 Capsule 目录创建为 `0700`；
+- state、JSON、manifest、SQLite 辅助文件和锁文件创建为 `0600`；
 - 复用已有 `.offwork` 前验证 owner、类型、mode 和 symlink；
 - 所有 Capsule archive path 使用 `.offwork` 内的规范相对路径；
 - 不跟随固定目录或 Capsule 成员 symlink。
+- V1.0 会在每次 SQLite 打开前检查 `.offwork` 固定路径；但 Python `sqlite3` 不能绑定到已经验证的文件描述符，因此不防护同一 UID 的恶意并发进程在检查后、SQLite 按路径打开前替换叶子条目。该竞态不在 V1.0 保护范围内，产品不得据此宣称能够抵御恶意本地同 UID 篡改。
 
 ### 16.3 可靠性
 
@@ -633,6 +634,7 @@ Capsule 发布遵循：
 | --- | --- | --- |
 | Receipt 只是结构完整，内容建议仍可能错误 | 新 Agent执行错误第一步 | Unknowns、freshness、禁止自动执行、fresh-agent 黑盒反例 |
 | 本地用户可同时修改 Capsule 和数据库 | 不能宣称防恶意篡改 | 明确只保证本地自洽，不宣称签名或不可抵赖 |
+| 同一 UID 恶意进程在检查与 SQLite 打开之间替换 `.offwork` 叶子条目 | SQLite 可能打开检查后的替换目标 | 保留每次打开前的 owner、类型、mode 和 symlink 检查；明确该并发竞态超出 V1.0 防护边界 |
 | Check 是任意本地程序 | 可访问项目外资源 | 仅运行用户显式配置的 check，明确非 sandbox，限制时长和输出 |
 | 父 Git 仓库污染子项目判断 | freshness 误报 | Git pathspec、项目内 fingerprint、父 HEAD 仅作 metadata |
 | Capture 在文件发布与 DB 注册间崩溃 | 孤儿或悬空记录 | durable publication 顺序与幂等对账 |

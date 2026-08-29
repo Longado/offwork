@@ -21,13 +21,19 @@ class TempProject:
     def cleanup(self) -> None:
         self._temporary_directory.cleanup()
 
-    def run(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        umask: int = -1,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(CLI), *args],
             cwd=str(cwd or self.root),
             text=True,
             capture_output=True,
             check=False,
+            umask=umask,
         )
 
     def init(self) -> Dict[str, Any]:

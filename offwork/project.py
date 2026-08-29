@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any, Dict
 
 from offwork.errors import OffworkError
-from offwork.state import initialize_database
+from offwork.state import (
+    PRIVATE_FILE_MODE,
+    create_private_directory,
+    initialize_database,
+    validate_database_paths,
+    validate_private_path,
+)
 
 
 STATE_DIR_NAME = ".offwork"
@@ -27,49 +33,108 @@ def canonical_project(path: str) -> Path:
     return project
 
 
-def _reject_symlink(path: Path) -> None:
-    try:
-        mode = path.lstat().st_mode
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(mode):
-        raise OffworkError(
-            "UNSAFE_STATE_PATH",
-            "Offwork state paths must not be symlinks",
-            details={"path": str(path)},
-        )
-
-
 def _ensure_directory(path: Path, mode: int) -> None:
-    _reject_symlink(path)
-    existed = path.exists()
-    path.mkdir(mode=mode, exist_ok=True)
-    if not path.is_dir():
-        raise OffworkError(
-            "UNSAFE_STATE_PATH",
-            "Expected a private directory",
-            details={"path": str(path)},
-        )
-    current = path.stat()
-    if existed and (
-        current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != mode
-    ):
-        raise OffworkError(
-            "UNSAFE_STATE_PATH",
-            "Existing Offwork directory has unsafe owner or permissions",
-            details={"path": str(path)},
-        )
-    os.chmod(path, mode)
+    existing = validate_private_path(
+        path,
+        expected_type="directory",
+        expected_mode=mode,
+        required=False,
+    )
+    if existing is not None:
+        return
+    create_private_directory(path, mode)
+    validate_private_path(path, expected_type="directory", expected_mode=mode)
 
 
 def _write_private_json(path: Path, value: Dict[str, Any]) -> None:
     payload = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork project metadata could not be created safely",
+            details={"path": str(path)},
+        ) from exc
+    try:
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
         os.write(descriptor, payload)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _read_private_json(path: Path) -> Dict[str, Any]:
+    validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork project metadata could not be opened safely",
+            details={"path": str(path)},
+        ) from exc
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or stat.S_IMODE(current.st_mode) != PRIVATE_FILE_MODE
+        ):
+            raise OffworkError(
+                "UNSAFE_STATE_PATH",
+                "Offwork project metadata changed during validation",
+                details={"path": str(path)},
+            )
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = -1
+            value = json.load(stream)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(value, dict):
+        raise json.JSONDecodeError("project metadata must be an object", "", 0)
+    return value
+
+
+def _ensure_lock_file(path: Path) -> None:
+    existing = validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if existing is not None:
+        return
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork lock file could not be created safely",
+            details={"path": str(path)},
+        ) from exc
+    try:
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+    finally:
+        os.close(descriptor)
+    validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
 
 
 def initialize_project(path: str) -> Dict[str, Any]:
@@ -79,11 +144,16 @@ def initialize_project(path: str) -> Dict[str, Any]:
     _ensure_directory(state_dir / "capsules", 0o700)
 
     project_file = state_dir / "project.json"
-    _reject_symlink(project_file)
-    if project_file.exists():
+    existing_project_file = validate_private_path(
+        project_file,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if existing_project_file is not None:
         try:
-            metadata = json.loads(project_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            metadata = _read_private_json(project_file)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise OffworkError(
                 "INVALID_PROJECT_STATE",
                 "Existing project metadata is invalid",
@@ -104,10 +174,7 @@ def initialize_project(path: str) -> Dict[str, Any]:
         _write_private_json(project_file, metadata)
 
     lock_file = state_dir / "state.lock"
-    _reject_symlink(lock_file)
-    descriptor = os.open(lock_file, os.O_WRONLY | os.O_CREAT, 0o600)
-    os.close(descriptor)
-    os.chmod(lock_file, 0o600)
+    _ensure_lock_file(lock_file)
 
     initialize_database(state_dir / "state.sqlite3")
     return metadata
@@ -116,18 +183,39 @@ def initialize_project(path: str) -> Dict[str, Any]:
 def load_project(path: str) -> Dict[str, Any]:
     project = canonical_project(path)
     state_dir = project / STATE_DIR_NAME
-    _reject_symlink(state_dir)
     project_file = state_dir / "project.json"
-    _reject_symlink(project_file)
-    if not state_dir.is_dir() or not project_file.is_file():
+    state_exists = validate_private_path(
+        state_dir,
+        expected_type="directory",
+        expected_mode=0o700,
+        required=False,
+    )
+    project_exists = validate_private_path(
+        project_file,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if state_exists is None or project_exists is None:
         raise OffworkError(
             "PROJECT_NOT_INITIALIZED",
             "Project has not been initialized by Offwork",
             details={"project_path": str(project)},
         )
+    validate_private_path(
+        state_dir / "state.lock",
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
+    validate_database_paths(state_dir / "state.sqlite3")
+    validate_private_path(
+        state_dir / "capsules",
+        expected_type="directory",
+        expected_mode=0o700,
+    )
     try:
-        metadata = json.loads(project_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        metadata = _read_private_json(project_file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OffworkError(
             "INVALID_PROJECT_STATE",
             "Project metadata is invalid",

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
 import shlex
 import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from offwork.capsule import _read_private_member
+from offwork.cli import main
+from offwork.errors import OffworkError
 from tests.helpers import TempProject
 
 
@@ -77,6 +84,122 @@ class CapsuleCaptureTests(unittest.TestCase):
         self.assertTrue((capsule_dir / "checks.json").is_file())
         self.assertTrue((capsule_dir / "restore-test.json").is_file())
         self.assertTrue((capsule_dir / "manifest.json").is_file())
+
+    def test_capture_creates_exact_private_capsule_under_restrictive_umask(self) -> None:
+        context_path = self.temp.write_context(CONTEXT)
+
+        result = self.temp.run(
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context_path),
+            "--project",
+            str(self.temp.project),
+            "--json",
+            umask=0o777,
+        )
+
+        capsules = self.temp.project / ".offwork" / "capsules"
+        staging_directories = list(capsules.glob(".staging-*"))
+        for staging in staging_directories:
+            staging.rmdir()
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        receipt = self.temp.json_stdout(result)["data"]
+        capsule = capsules / receipt["capsule"]["capsule_id"]
+        self.assertEqual(os.stat(capsule).st_mode & 0o777, 0o700)
+        for member in capsule.iterdir():
+            self.assertEqual(os.stat(member).st_mode & 0o777, 0o600)
+        self.assertEqual(staging_directories, [])
+
+    def test_staging_setup_failure_returns_one_json_error_and_no_residue(self) -> None:
+        context_path = self.temp.write_context(CONTEXT)
+        stdout = io.StringIO()
+        arguments = [
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context_path),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        ]
+
+        setup_failure = PermissionError("staging denied")
+        with mock.patch(
+            "offwork.capsule.Path.mkdir", side_effect=setup_failure
+        ), mock.patch(
+            "offwork.state.os.mkdir", side_effect=setup_failure
+        ), contextlib.redirect_stdout(stdout):
+            try:
+                returncode = main(arguments)
+            except OSError as exc:
+                self.fail(f"capture leaked an OS error instead of a JSON envelope: {exc}")
+
+        self.assertNotEqual(returncode, 0)
+        envelope = json.loads(stdout.getvalue())
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], "UNSAFE_STATE_PATH")
+        capsules = self.temp.project / ".offwork" / "capsules"
+        self.assertEqual(list(capsules.glob(".staging-*")), [])
+
+    def test_payload_write_failure_returns_one_json_error_and_no_residue(self) -> None:
+        context_path = self.temp.write_context(CONTEXT)
+        stdout = io.StringIO()
+        arguments = [
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context_path),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        ]
+
+        with mock.patch(
+            "offwork.capsule._write_private",
+            side_effect=PermissionError("payload write denied"),
+        ), contextlib.redirect_stdout(stdout):
+            try:
+                returncode = main(arguments)
+            except OSError as exc:
+                self.fail(f"capture leaked an OS error instead of a JSON envelope: {exc}")
+
+        self.assertNotEqual(returncode, 0)
+        envelope = json.loads(stdout.getvalue())
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], "CAPSULE_PUBLICATION_FAILED")
+        capsules = self.temp.project / ".offwork" / "capsules"
+        self.assertEqual(list(capsules.glob(".staging-*")), [])
+
+    def test_publication_preserves_existing_offwork_error(self) -> None:
+        context_path = self.temp.write_context(CONTEXT)
+        stdout = io.StringIO()
+        arguments = [
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context_path),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        ]
+        expected = OffworkError("PUBLICATION_SENTINEL", "preserve this error")
+
+        with mock.patch(
+            "offwork.capsule._write_private",
+            side_effect=expected,
+        ), contextlib.redirect_stdout(stdout):
+            returncode = main(arguments)
+
+        self.assertNotEqual(returncode, 0)
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual(envelope["error"]["code"], "PUBLICATION_SENTINEL")
+        capsules = self.temp.project / ".offwork" / "capsules"
+        self.assertEqual(list(capsules.glob(".staging-*")), [])
 
     def test_invalid_context_returns_stable_json_error(self) -> None:
         invalid = dict(CONTEXT)
@@ -271,6 +394,30 @@ class CapsuleIntegrityTests(unittest.TestCase):
             self.temp.json_stdout(result)["error"]["code"],
             "CAPSULE_INTEGRITY_FAILED",
         )
+
+    def test_member_read_uses_bytes_from_same_validated_descriptor(self) -> None:
+        member = self.temp.root / "member.json"
+        replacement = self.temp.root / "replacement.json"
+        original_bytes = b'{"source":"opened descriptor"}'
+        member.write_bytes(original_bytes)
+        replacement.write_bytes(b'{"source":"replacement path"}')
+        os.chmod(member, 0o600)
+        os.chmod(replacement, 0o600)
+        real_fstat = os.fstat
+
+        def replace_path_after_fstat(descriptor: int):
+            current = real_fstat(descriptor)
+            member.unlink()
+            member.symlink_to(replacement)
+            return current
+
+        with mock.patch(
+            "offwork.capsule.os.fstat",
+            side_effect=replace_path_after_fstat,
+        ):
+            loaded = _read_private_member(member, "capsule-test", "member.json")
+
+        self.assertEqual(loaded, original_bytes)
 
     def test_unknown_capsule_member_is_rejected(self) -> None:
         (self.capsule_dir / "extra.txt").write_text("unexpected", encoding="utf-8")
