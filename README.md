@@ -25,6 +25,18 @@ Offwork is a Python 3.9+ standard-library CLI. It requires system Git and has no
 
 The Loop 6 clean-clone proof was run on macOS 26.4.1 arm64 with Python 3.9.6 and Apple Git 2.50.1. The CLI targets POSIX process behavior; Linux is intended but was not independently verified in that run, and Windows support is not claimed.
 
+## Three-minute Terminal demo
+
+This four-frame walkthrough comes from one real CLI run against one disposable Git project and one Capsule. It shows how Offwork Capsule captures the handoff, resumes it in a fresh Session, detects later workspace changes independently from Capsule integrity, and records an explicit human decision.
+
+| 01 · Capture current work | 02 · Resume in a fresh Session |
+| --- | --- |
+| [![Capture current work](./docs/assets/terminal-demo/01-capture.jpg)](./docs/assets/terminal-demo/01-capture.jpg) | [![Resume in a fresh Session](./docs/assets/terminal-demo/02-resume.jpg)](./docs/assets/terminal-demo/02-resume.jpg) |
+| **03 · Compare workspace freshness** | **04 · Record the human decision** |
+| [![Compare workspace freshness](./docs/assets/terminal-demo/03-freshness.jpg)](./docs/assets/terminal-demo/03-freshness.jpg) | [![Record the human decision](./docs/assets/terminal-demo/04-human-decision.jpg)](./docs/assets/terminal-demo/04-human-decision.jpg) |
+
+The first two frames preserve the exact difference between an Agent claim and an Offwork-observed check. The third keeps Capsule integrity `passed` while reporting the later workspace change. The fourth binds the human decision, timestamp, and note to the Capsule and Task revision.
+
 ## Architecture
 
 Offwork Capsule is organized around a trust flow, not an Agent orchestration loop. Capture collects only the explicit context, authorized checks, and explicit Git project snapshot. Resume rebuilds a Receipt from the published Capsule and compares that evidence with the current workspace.

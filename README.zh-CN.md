@@ -23,6 +23,18 @@ Offwork 使用 Python 3.9+ 标准库实现，需要系统安装 Git，核心 CLI
 
 Loop 6 的干净克隆验证运行于 macOS 26.4.1 arm64、Python 3.9.6 和 Apple Git 2.50.1。部分进程管理依赖 POSIX 行为；Linux 尚未单独验证，当前也不声明支持 Windows。
 
+## 3 分钟 Terminal 演示
+
+下面四张图来自同一次真实 CLI 运行：一个临时 Git 项目、一个 Task、一个 Capsule。整段演示依次展示 Offwork Capsule 如何保存当前交接、让全新 Session 接手、识别之后发生的工作区变化，以及记录明确的人工决定。
+
+| 01 · 保存当前工作 | 02 · 全新 Session 接手 |
+| --- | --- |
+| [![保存当前工作](./docs/assets/terminal-demo/01-capture.jpg)](./docs/assets/terminal-demo/01-capture.jpg) | [![全新 Session 接手](./docs/assets/terminal-demo/02-resume.jpg)](./docs/assets/terminal-demo/02-resume.jpg) |
+| **03 · 识别工作区变化** | **04 · 记录人工决定** |
+| [![识别工作区变化](./docs/assets/terminal-demo/03-freshness.jpg)](./docs/assets/terminal-demo/03-freshness.jpg) | [![记录人工决定](./docs/assets/terminal-demo/04-human-decision.jpg)](./docs/assets/terminal-demo/04-human-decision.jpg) |
+
+前两张图会同时保留 Agent 的说法和 Offwork 实际运行检查得到的结果。第三张图显示：项目发生变化时，Capsule integrity 仍保持 `passed`，workspace freshness 会独立变为 `changed`。第四张图把人工决定、时间和备注绑定到对应的 Capsule 与 Task revision。
+
 ## 架构
 
 Offwork Capsule 关注的是“交接是否可信”，而不是替用户调度 Agent。执行 `capture` 时，它只收集用户提供的 context、用户授权的检查结果，以及指定 Git 项目的现场快照。执行 `resume` 时，它会从已发布的 Capsule 重新生成 Receipt，再单独比较当前工作区有没有变化。
