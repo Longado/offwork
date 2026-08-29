@@ -9,11 +9,13 @@ import sqlite3
 import subprocess
 import threading
 import unittest
+from copy import deepcopy
 from unittest import mock
 
 from offwork import capsule as capsule_module
 from offwork.capsule import capture
 from offwork.cli import main
+from offwork.output import render_receipt
 from offwork.project import load_project
 from offwork.state import StateService
 from tests.helpers import TempProject
@@ -124,6 +126,121 @@ class ReceiptTests(unittest.TestCase):
             "unavailable",
         ):
             self.assertIn(str(expected), result.stdout)
+
+    def test_human_receipt_renders_all_decision_grade_canonical_facts(self) -> None:
+        context = deepcopy(CONTEXT)
+        context["open_loops"] = [
+            {
+                "title": "LOOP_TITLE_SENTINEL",
+                "disposition": "delegate",
+                "note": "LOOP_NOTE_SENTINEL",
+            }
+        ]
+        captured = self.capture(context, "decision-grade.json")
+        receipt = deepcopy(captured)
+        receipt["human_acceptance"] = {
+            "status": "accepted",
+            "acted_at": "ACCEPTED_AT_SENTINEL",
+            "note": "ACCEPTANCE_NOTE_SENTINEL",
+        }
+        receipt["workspace_freshness"].update(
+            {
+                "scope": "FRESHNESS_SCOPE_SENTINEL",
+                "checked_at": "FRESHNESS_CHECKED_AT_SENTINEL",
+                "changes": ["FRESHNESS_CHANGE_SENTINEL"],
+                "limitations": ["FRESHNESS_LIMITATION_SENTINEL"],
+            }
+        )
+        receipt["auto_checked"] = {
+            "status": "failed",
+            "checks": [
+                {
+                    "command": "CHECK_COMMAND_SENTINEL",
+                    "argv": ["CHECK_ARGV_SENTINEL", "参数"],
+                    "cwd": "CHECK_CWD_SENTINEL",
+                    "status": "failed",
+                    "returncode": 17,
+                    "started_at": "CHECK_STARTED_AT_SENTINEL",
+                    "finished_at": "CHECK_FINISHED_AT_SENTINEL",
+                }
+            ],
+        }
+
+        human = render_receipt(receipt)
+
+        expected_facts = (
+            receipt["task"]["task_id"],
+            receipt["task"]["current_revision"],
+            receipt["task"]["captured_revision"],
+            receipt["capsule"]["capsule_id"],
+            receipt["capsule"]["captured_at"],
+            "LOOP_TITLE_SENTINEL",
+            "delegate",
+            "LOOP_NOTE_SENTINEL",
+            "FRESHNESS_SCOPE_SENTINEL",
+            "FRESHNESS_CHECKED_AT_SENTINEL",
+            "FRESHNESS_CHANGE_SENTINEL",
+            "FRESHNESS_LIMITATION_SENTINEL",
+            "accepted",
+            "ACCEPTED_AT_SENTINEL",
+            "ACCEPTANCE_NOTE_SENTINEL",
+            "CHECK_COMMAND_SENTINEL",
+            "CHECK_ARGV_SENTINEL",
+            "参数",
+            "CHECK_CWD_SENTINEL",
+            "failed",
+            17,
+            "CHECK_STARTED_AT_SENTINEL",
+            "CHECK_FINISHED_AT_SENTINEL",
+        )
+        for fact in expected_facts:
+            self.assertIn(str(fact), human)
+
+    def test_human_receipt_escapes_terminal_controls_but_preserves_chinese(self) -> None:
+        captured = self.capture(CONTEXT, "hostile.json")
+        receipt = deepcopy(captured)
+        receipt["task"]["title"] = (
+            "正常中文\n伪造标题\x00\x1b[31m红色\x85"
+            "\u202e反向\u2066隔离\ufeff格式\u2028行分隔\u2029段分隔"
+        )
+
+        human = render_receipt(receipt)
+
+        self.assertIn("正常中文", human)
+        for control in ("\x00", "\x1b", "\x85", "\u202e", "\u2066", "\ufeff", "\u2028", "\u2029"):
+            self.assertNotIn(control, human)
+        for escaped in (
+            "\\n",
+            "\\x00",
+            "\\x1b",
+            "\\u0085",
+            "\\u202e",
+            "\\u2066",
+            "\\ufeff",
+            "\\u2028",
+            "\\u2029",
+        ):
+            self.assertIn(escaped, human)
+
+    def test_human_receipt_renders_json_null_facts_as_null(self) -> None:
+        captured = self.capture(CONTEXT, "nulls.json")
+
+        human = render_receipt(captured)
+
+        self.assertIn("- Acted at: null", human)
+        self.assertIn("- Note: null", human)
+
+    def test_human_receipt_makes_empty_decision_lists_explicit(self) -> None:
+        context = deepcopy(CONTEXT)
+        context["unknowns"] = []
+        context["open_loops"] = []
+        captured = self.capture(context, "empty-lists.json")
+
+        human = render_receipt(captured)
+
+        self.assertIn("- Captured changes: none", human)
+        self.assertIn("Unknowns:\n- none", human)
+        self.assertIn("Open loops:\n- none", human)
 
 
 class FreshnessTests(unittest.TestCase):

@@ -1076,6 +1076,35 @@ class CapsuleIntegrityTests(unittest.TestCase):
         self.assertEqual(envelope["error"]["details"]["integrity"], "failed")
         self.assertEqual(envelope["error"]["details"]["freshness"], "not_evaluated")
 
+    def test_human_integrity_failure_preserves_capsule_and_freshness_facts(self) -> None:
+        manifest = self.capsule_dir / "manifest.json"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"], "--capsule", self.capsule_id,
+            "--project", str(self.temp.project)
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("CAPSULE_INTEGRITY_FAILED", result.stderr)
+        self.assertIn(self.capsule_id, result.stderr)
+        self.assertIn("Integrity: failed", result.stderr)
+        self.assertIn("Workspace freshness: not_evaluated", result.stderr)
+
+    def test_nested_integrity_error_uses_stable_json_command_name(self) -> None:
+        manifest = self.capsule_dir / "manifest.json"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+        result = self.temp.run(
+            "task", "show", self.task["task_id"], "--capsule", self.capsule_id,
+            "--project", str(self.temp.project), "--json"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        envelope = self.temp.json_stdout(result)
+        self.assertEqual(envelope["command"], "task.show")
+
     def test_payload_tamper_returns_integrity_failure(self) -> None:
         payload = self.capsule_dir / "capsule.json"
         value = json.loads(payload.read_text(encoding="utf-8"))
