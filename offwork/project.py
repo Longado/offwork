@@ -278,8 +278,22 @@ def _metadata(project: Path, name: str, *arguments: str) -> str | None:
     return value or None
 
 
+def _git_index_fingerprint(staged: subprocess.CompletedProcess[bytes], prefix: str) -> str:
+    digest = hashlib.sha256()
+    for record in staged.stdout.split(b"\0"):
+        _metadata_fields, separator, raw_path = record.partition(b"\t")
+        if not separator:
+            continue
+        relative = _project_relative(os.fsdecode(raw_path), prefix)
+        if relative is None:
+            continue
+        digest.update(len(record).to_bytes(8, "big"))
+        digest.update(record)
+    return digest.hexdigest()
+
+
 def _project_relative(repo_path: str, prefix: str) -> str | None:
-    normalized = repo_path.replace("\\", "/")
+    normalized = repo_path
     if prefix:
         marker = prefix.rstrip("/") + "/"
         if not normalized.startswith(marker):
@@ -367,6 +381,30 @@ def _snapshot_entry(project_descriptor: int, relative: str) -> Dict[str, Any]:
         os.close(parent_descriptor)
 
 
+def _has_nested_git_repository(project: Path, project_is_git_root: bool) -> bool:
+    def unreadable(_error: OSError) -> None:
+        raise _WorkspacePathUnavailable("required_path_unreadable")
+
+    project_text = os.fspath(project)
+    for root, directories, files in os.walk(
+        project,
+        topdown=True,
+        onerror=unreadable,
+        followlinks=False,
+    ):
+        at_project_root = root == project_text
+        if at_project_root and ".offwork" in directories:
+            directories.remove(".offwork")
+        if ".git" not in directories and ".git" not in files:
+            continue
+        if at_project_root and project_is_git_root:
+            if ".git" in directories:
+                directories.remove(".git")
+            continue
+        return True
+    return False
+
+
 def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return _capture_workspace(project)
@@ -381,6 +419,26 @@ def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
+    first = _capture_workspace_once(project)
+    if not first.get("reliable"):
+        return first
+    second = _capture_workspace_once(project)
+    if not second.get("reliable"):
+        return second
+    if first != second:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "unstable_workspace_scan",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    stable = dict(second)
+    stable.pop("_git_scan_fingerprint", None)
+    return stable
+
+
+def _capture_workspace_once(project: Dict[str, Any]) -> Dict[str, Any]:
     project_path: Path = project["path"]
     root_text = _metadata(project_path, "root", "rev-parse", "--show-toplevel")
     if root_text is None:
@@ -403,7 +461,29 @@ def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
             "project_path": project["project_path"],
         }
     prefix = "" if relative_prefix == "." else relative_prefix
-    pathspec = "." if not prefix else prefix
+    pathspec = ":(top,literal)" + prefix
+
+    try:
+        has_nested_git_repository = _has_nested_git_repository(
+            project_path,
+            project_path == git_root,
+        )
+    except _WorkspacePathUnavailable as exc:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": exc.reason,
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    if has_nested_git_repository:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "nested_git_repository",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
 
     staged = _git(git_root, "ls-files", "--stage", "-z", "--", pathspec)
     listed = _git(
@@ -477,14 +557,21 @@ def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
         "--",
         pathspec,
     )
+    if status_result.returncode != 0:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "git_scan_failed",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
     changed_paths = []
-    if status_result.returncode == 0:
-        for record in status_result.stdout.split(b"\0"):
-            if len(record) < 4:
-                continue
-            relative = _project_relative(os.fsdecode(record[3:]), prefix)
-            if relative is not None:
-                changed_paths.append(relative)
+    for record in status_result.stdout.split(b"\0"):
+        if len(record) < 4:
+            continue
+        relative = _project_relative(os.fsdecode(record[3:]), prefix)
+        if relative is not None:
+            changed_paths.append(relative)
 
     branch = _metadata(project_path, "branch", "symbolic-ref", "--short", "-q", "HEAD")
     head = _metadata(project_path, "head", "rev-parse", "HEAD")
@@ -499,6 +586,7 @@ def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
         "head": head,
         "entries": entries,
         "changed_paths": sorted(set(changed_paths)),
+        "_git_scan_fingerprint": _git_index_fingerprint(staged, prefix),
     }
 
 
@@ -517,6 +605,15 @@ def compare_workspace(captured: Dict[str, Any], current: Dict[str, Any]) -> Dict
             "status": "unavailable",
             "changes": [],
             "limitations": ["project_identity_mismatch"],
+        }
+    if (
+        captured.get("git_root") != current.get("git_root")
+        or captured.get("project_is_git_root") != current.get("project_is_git_root")
+    ):
+        return {
+            "status": "unavailable",
+            "changes": [],
+            "limitations": ["git_boundary_changed"],
         }
     captured_entries = captured.get("entries", {})
     current_entries = current.get("entries", {})

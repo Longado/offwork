@@ -8,8 +8,14 @@ import subprocess
 import unittest
 from unittest import mock
 
+import offwork.project as project_module
 from offwork.errors import OffworkError
-from offwork.project import _write_private_json, capture_workspace, load_project
+from offwork.project import (
+    _write_private_json,
+    capture_workspace,
+    compare_workspace,
+    load_project,
+)
 from offwork.state import StateService
 from tests.helpers import TempProject
 
@@ -457,6 +463,231 @@ class WorkspaceObservationTests(unittest.TestCase):
 
         self.assertFalse(snapshot["reliable"])
         self.assertEqual(snapshot["reason"], "unsafe_workspace_path")
+
+    def test_pathspec_magic_project_name_cannot_hide_workspace_change(self) -> None:
+        parent = self.temp.root / "magic-parent"
+        project_path = parent / ":(literal)nested"
+        project_path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(parent)], check=True)
+        subprocess.run(
+            ["git", "-C", str(parent), "config", "user.email", "offwork@example.test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(parent), "config", "user.name", "Offwork Tests"],
+            check=True,
+        )
+        tracked = project_path / "tracked.txt"
+        tracked.write_text("captured\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(parent), "add", "--all"], check=True)
+        subprocess.run(["git", "-C", str(parent), "commit", "-qm", "initial"], check=True)
+        metadata = self.temp.run("init", "--project", str(project_path), "--json")
+        self.assertEqual(metadata.returncode, 0, metadata.stderr or metadata.stdout)
+        project = load_project(str(project_path))
+
+        captured = capture_workspace(project)
+        tracked.write_text("changed\n", encoding="utf-8")
+        current = capture_workspace(project)
+
+        self.assertTrue(captured["reliable"])
+        self.assertIn("tracked.txt", captured["entries"])
+        freshness = compare_workspace(captured, current)
+        self.assertEqual(freshness["status"], "changed")
+        self.assertIn("tracked.txt", freshness["changes"])
+
+    @unittest.skipIf(os.name == "nt", "backslash is not a legal filename character on Windows")
+    def test_backslash_project_name_cannot_hide_workspace_change(self) -> None:
+        parent = self.temp.root / "backslash-parent"
+        project_path = parent / "nested\\project"
+        project_path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(parent)], check=True)
+        subprocess.run(
+            ["git", "-C", str(parent), "config", "user.email", "offwork@example.test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(parent), "config", "user.name", "Offwork Tests"],
+            check=True,
+        )
+        tracked = project_path / "tracked.txt"
+        tracked.write_text("captured\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(parent), "add", "--all"], check=True)
+        subprocess.run(["git", "-C", str(parent), "commit", "-qm", "initial"], check=True)
+        metadata = self.temp.run("init", "--project", str(project_path), "--json")
+        self.assertEqual(metadata.returncode, 0, metadata.stderr or metadata.stdout)
+        project = load_project(str(project_path))
+
+        captured = capture_workspace(project)
+        tracked.write_text("changed\n", encoding="utf-8")
+        current = capture_workspace(project)
+
+        self.assertTrue(captured["reliable"])
+        self.assertIn("tracked.txt", captured["entries"])
+        freshness = compare_workspace(captured, current)
+        self.assertEqual(freshness["status"], "changed")
+        self.assertIn("tracked.txt", freshness["changes"])
+
+    def test_new_nested_git_root_makes_workspace_unavailable(self) -> None:
+        nested = self.temp.project / "nested"
+        nested.mkdir()
+        (nested / "tracked.txt").write_text("captured\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "add", "nested/tracked.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.temp.project), "commit", "-qm", "add nested file"],
+            check=True,
+        )
+        project = load_project(str(self.temp.project))
+        captured = capture_workspace(project)
+
+        subprocess.run(["git", "init", "-q", str(nested)], check=True)
+        current = capture_workspace(project)
+
+        self.assertTrue(captured["reliable"])
+        self.assertFalse(current["reliable"])
+        self.assertEqual(current["reason"], "nested_git_repository")
+        freshness = compare_workspace(captured, current)
+        self.assertEqual(freshness["status"], "unavailable")
+        self.assertIn("nested_git_repository", freshness["limitations"])
+
+    def test_project_becoming_git_root_makes_comparison_unavailable(self) -> None:
+        parent = self.temp.root / "boundary-parent"
+        project_path = parent / "nested"
+        project_path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(parent)], check=True)
+        subprocess.run(
+            ["git", "-C", str(parent), "config", "user.email", "offwork@example.test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(parent), "config", "user.name", "Offwork Tests"],
+            check=True,
+        )
+        (project_path / "tracked.txt").write_text("captured\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(parent), "add", "--all"], check=True)
+        subprocess.run(["git", "-C", str(parent), "commit", "-qm", "initial"], check=True)
+        metadata = self.temp.run("init", "--project", str(project_path), "--json")
+        self.assertEqual(metadata.returncode, 0, metadata.stderr or metadata.stdout)
+        project = load_project(str(project_path))
+        captured = capture_workspace(project)
+
+        subprocess.run(["git", "init", "-q", str(project_path)], check=True)
+        current = capture_workspace(project)
+
+        self.assertTrue(captured["reliable"])
+        self.assertTrue(current["reliable"])
+        freshness = compare_workspace(captured, current)
+        self.assertEqual(freshness["status"], "unavailable")
+        self.assertIn("git_boundary_changed", freshness["limitations"])
+
+    def test_change_during_scan_cannot_return_false_fresh(self) -> None:
+        project = load_project(str(self.temp.project))
+        captured = capture_workspace(project)
+        original_snapshot_entry = project_module._snapshot_entry
+        mutation_done = False
+
+        def snapshot_then_mutate(project_descriptor: int, relative: str) -> dict:
+            nonlocal mutation_done
+            entry = original_snapshot_entry(project_descriptor, relative)
+            if relative == "tracked.txt" and not mutation_done:
+                mutation_done = True
+                (self.temp.project / relative).write_text("changed during scan\n", encoding="utf-8")
+            return entry
+
+        with mock.patch(
+            "offwork.project._snapshot_entry",
+            side_effect=snapshot_then_mutate,
+        ):
+            current = capture_workspace(project)
+
+        self.assertTrue(mutation_done)
+        self.assertFalse(current["reliable"])
+        self.assertEqual(current["reason"], "unstable_workspace_scan")
+        freshness = compare_workspace(captured, current)
+        self.assertEqual(freshness["status"], "unavailable")
+        self.assertIn("unstable_workspace_scan", freshness["limitations"])
+
+    def test_git_index_change_during_scan_makes_workspace_unavailable(self) -> None:
+        project = load_project(str(self.temp.project))
+        original_git = project_module._git
+        mutation_done = False
+
+        def git_then_mutate_index(git_project, *arguments):
+            nonlocal mutation_done
+            result = original_git(git_project, *arguments)
+            if arguments[:2] == ("ls-files", "--stage") and not mutation_done:
+                mutation_done = True
+                blob = subprocess.run(
+                    ["git", "-C", str(self.temp.project), "hash-object", "-w", "--stdin"],
+                    input=b"staged-only change\n",
+                    stdout=subprocess.PIPE,
+                    check=True,
+                ).stdout.decode("ascii").strip()
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.temp.project),
+                        "update-index",
+                        "--cacheinfo",
+                        "100644",
+                        blob,
+                        "tracked.txt",
+                    ],
+                    check=True,
+                )
+            return result
+
+        with mock.patch("offwork.project._git", side_effect=git_then_mutate_index):
+            current = capture_workspace(project)
+
+        self.assertTrue(mutation_done)
+        self.assertFalse(current["reliable"])
+        self.assertEqual(current["reason"], "unstable_workspace_scan")
+
+    def test_git_status_failure_cannot_produce_reliable_snapshot(self) -> None:
+        project = load_project(str(self.temp.project))
+        original_git = project_module._git
+
+        def fail_status(git_project, *arguments):
+            if arguments and arguments[0] == "status":
+                return subprocess.CompletedProcess(
+                    args=["git", *arguments],
+                    returncode=1,
+                    stdout=b"",
+                    stderr=b"status failed",
+                )
+            return original_git(git_project, *arguments)
+
+        with mock.patch("offwork.project._git", side_effect=fail_status):
+            current = capture_workspace(project)
+
+        self.assertFalse(current["reliable"])
+        self.assertEqual(current["reason"], "git_scan_failed")
+
+    def test_internal_state_change_during_scan_remains_excluded(self) -> None:
+        project = load_project(str(self.temp.project))
+        original_git = project_module._git
+        mutation_done = False
+
+        def git_then_mutate_state(git_project, *arguments):
+            nonlocal mutation_done
+            result = original_git(git_project, *arguments)
+            if arguments and arguments[0] == "ls-files" and "--others" in arguments and not mutation_done:
+                mutation_done = True
+                (self.temp.project / ".offwork" / "scan-probe").write_text(
+                    "ignored state\n",
+                    encoding="utf-8",
+                )
+            return result
+
+        with mock.patch("offwork.project._git", side_effect=git_then_mutate_state):
+            current = capture_workspace(project)
+
+        self.assertTrue(mutation_done)
+        self.assertTrue(current["reliable"])
 
 
 if __name__ == "__main__":
