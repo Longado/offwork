@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "response.schema.json",
+  "title": "Offwork history-free Agent decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "cited_receipt_facts",
+    "proposed_first_action"
+  ],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": [
+        "continue",
+        "verify",
+        "stop"
+      ]
+    },
+    "cited_receipt_facts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "receipt_path",
+          "value",
+          "relevance"
+        ],
+        "properties": {
+          "receipt_path": {
+            "type": "string",
+            "pattern": "^\\$.+"
+          },
+          "value": {},
+          "relevance": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "proposed_first_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "value",
+        "receipt_path",
+        "reason"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "project_action",
+            "verification",
+            "none"
+          ]
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "receipt_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "decision": {
+          "const": "continue"
+        },
+        "proposed_first_action": {
+          "properties": {
+            "mode": {
+              "const": "project_action"
+            },
+            "value": {
+              "const": "Add the approved assertion to tracked.txt."
+            },
+            "receipt_path": {
+              "const": "$.data.next_step"
+            }
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "decision": {
+          "const": "verify"
+        },
+        "proposed_first_action": {
+          "properties": {
+            "mode": {
+              "const": "verification"
+            },
+            "value": {
+              "const": "Review the diff for tracked.txt before modifying any project file."
+            },
+            "receipt_path": {
+              "const": "$.data.next_step"
+            }
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "decision": {
+          "const": "stop"
+        },
+        "proposed_first_action": {
+          "properties": {
+            "mode": {
+              "const": "none"
+            },
+            "value": {
+              "const": null
+            },
+            "receipt_path": {
+              "const": null
+            }
+          }
+        }
+      }
+    }
+  ]
+}

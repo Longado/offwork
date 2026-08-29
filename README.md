@@ -15,6 +15,8 @@ It does not prove that an Agent is correct. It gives the next Agent and the user
 
 Offwork is a Python 3.9+ standard-library CLI. It requires system Git and has no production package dependencies.
 
+The Loop 6 clean-clone proof was run on macOS 26.4.1 arm64 with Python 3.9.6 and Apple Git 2.50.1. The CLI targets POSIX process behavior; Linux is intended but was not independently verified in that run, and Windows support is not claimed.
+
 ## Run without installing
 
 From any directory, invoke the repository launcher by absolute path:
@@ -41,26 +43,28 @@ git -C "$DEMO_PROJECT" add auth.txt
 git -C "$DEMO_PROJECT" commit -qm initial
 ```
 
-Set the launcher path and initialize Offwork:
+From the Offwork repository root, set the launcher path and initialize Offwork:
 
 ```bash
-OFFWORK=/absolute/path/to/offwork/bin/offwork
+OFFWORK="$(pwd)/bin/offwork"
 "$OFFWORK" init --project "$DEMO_PROJECT" --json
 ```
 
-Create a Task with one real check:
+Create a Task whose check fails in a controlled way. This makes the difference between an Agent claim and an Offwork check visible:
 
 ```bash
-"$OFFWORK" task add "修复登录失败" \
+TASK_JSON="$("$OFFWORK" task add "修复登录失败" \
   --goal "恢复 Token 刷新行为" \
-  --check "python3 -c \"from pathlib import Path; assert Path('auth.txt').exists()\"" \
+  --check "python3 -c \"assert False, 'controlled Offwork demo failure'\"" \
   --project "$DEMO_PROJECT" \
-  --json
+  --json)"
+TASK_ID="$(printf '%s' "$TASK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["task_id"])')"
 ```
 
-Copy the returned `task_id`, then create `context.json`:
+Create the capture context exactly as shown:
 
-```json
+```bash
+cat > "$DEMO_PROJECT/context.json" <<'JSON'
 {
   "summary": "已实现 Token 刷新修复并补充测试",
   "agent_claims": [
@@ -79,34 +83,41 @@ Copy the returned `task_id`, then create `context.json`:
   ],
   "next_step": "运行旧 Token 迁移测试"
 }
+JSON
 ```
 
 Capture the handoff:
 
 ```bash
-"$OFFWORK" capture \
-  --task TASK_ID \
-  --context /absolute/path/to/context.json \
+CAPTURE_JSON="$("$OFFWORK" capture \
+  --task "$TASK_ID" \
+  --context "$DEMO_PROJECT/context.json" \
   --project "$DEMO_PROJECT" \
-  --json
+  --json)"
+CAPSULE_ID="$(printf '%s' "$CAPTURE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["capsule"]["capsule_id"])')"
+TASK_REVISION="$(printf '%s' "$CAPTURE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["task"]["current_revision"])')"
+AGENT_CLAIM="$(printf '%s' "$CAPTURE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["agent_claimed"]["items"][1])')"
+CHECK_STATUS="$(printf '%s' "$CAPTURE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["auto_checked"]["status"])')"
+printf 'Agent claim: %s\nOffwork check: %s\n' "$AGENT_CLAIM" "$CHECK_STATUS"
+"$OFFWORK" task show "$TASK_ID" --capsule "$CAPSULE_ID" --project "$DEMO_PROJECT"
 ```
 
-The Receipt should show these independent facts:
+The output visibly keeps the contradiction instead of merging it into one optimistic status:
 
 ```text
-agent_claimed.items includes "测试全部通过"
-auto_checked.status is "passed" only because Offwork ran the configured check
+Agent claim: 测试全部通过
+Offwork check: failed
 workspace_freshness.status is "fresh"
 human_acceptance.status is "pending"
 ```
 
-Copy the returned `capsule_id` and `task.current_revision`. Modify the workspace and inspect the same Capsule:
+Modify the workspace and inspect the same Capsule:
 
 ```bash
 printf 'changed after capture\n' > "$DEMO_PROJECT/auth.txt"
 
-"$OFFWORK" task show TASK_ID \
-  --capsule CAPSULE_ID \
+"$OFFWORK" task show "$TASK_ID" \
+  --capsule "$CAPSULE_ID" \
   --project "$DEMO_PROJECT" \
   --json
 ```
@@ -123,10 +134,10 @@ human_acceptance.status = "pending"
 Explicitly accept the Capsule you reviewed:
 
 ```bash
-"$OFFWORK" task accept TASK_ID \
-  --capsule CAPSULE_ID \
-  --if-revision REVISION_FROM_RECEIPT \
-  --note "reviewed after workspace warning" \
+"$OFFWORK" task accept "$TASK_ID" \
+  --capsule "$CAPSULE_ID" \
+  --if-revision "$TASK_REVISION" \
+  --note "reviewed after workspace warning and controlled failed check" \
   --project "$DEMO_PROJECT" \
   --json
 ```
@@ -136,8 +147,8 @@ Use `task reject` with the same arguments to reject instead. A stale revision is
 Render the same facts for a human or a new Agent:
 
 ```bash
-"$OFFWORK" task show TASK_ID --capsule CAPSULE_ID --project "$DEMO_PROJECT"
-"$OFFWORK" resume --task TASK_ID --capsule CAPSULE_ID --project "$DEMO_PROJECT" --json
+"$OFFWORK" task show "$TASK_ID" --capsule "$CAPSULE_ID" --project "$DEMO_PROJECT"
+"$OFFWORK" resume --task "$TASK_ID" --capsule "$CAPSULE_ID" --project "$DEMO_PROJECT" --json
 ```
 
 `resume` only renders the Receipt. It never executes `next_step`, restores files, stashes changes, switches branches, or controls an Agent.

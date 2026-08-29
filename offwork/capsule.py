@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -12,11 +13,48 @@ from typing import Any, Dict
 from offwork.errors import OffworkError
 from offwork.checks import run_checks
 from offwork.project import capture_workspace
-from offwork.state import StateService, utc_now
+from offwork.state import (
+    StateService,
+    create_private_directory,
+    state_lock,
+    utc_now,
+    validate_private_path,
+)
 
 
 PAYLOAD_NAMES = ("capsule.json", "checks.json", "restore-test.json")
 CAPSULE_MEMBERS = frozenset((*PAYLOAD_NAMES, "manifest.json"))
+CAPTURE_CONTEXT_FIELDS = (
+    "summary",
+    "agent_claims",
+    "unknowns",
+    "open_loops",
+    "next_step",
+)
+CAPTURE_CONTEXT_FIELD_SET = frozenset(CAPTURE_CONTEXT_FIELDS)
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _has_fixed_v1_context_structure(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == CAPTURE_CONTEXT_FIELD_SET
+        and isinstance(value.get("summary"), str)
+        and _is_string_list(value.get("agent_claims"))
+        and _is_string_list(value.get("unknowns"))
+        and isinstance(value.get("open_loops"), list)
+        and all(
+            isinstance(loop, dict)
+            and isinstance(loop.get("title"), str)
+            and isinstance(loop.get("disposition"), str)
+            and isinstance(loop.get("note"), str)
+            for loop in value["open_loops"]
+        )
+        and isinstance(value.get("next_step"), str)
+    )
 
 
 def _json_bytes(value: Dict[str, Any]) -> bytes:
@@ -24,9 +62,19 @@ def _json_bytes(value: Dict[str, Any]) -> bytes:
 
 
 def _write_private(path: Path, payload: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
     try:
-        os.write(descriptor, payload)
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("Capsule member write made no progress")
+            remaining = remaining[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -52,6 +100,161 @@ def _integrity_error(capsule_id: str, message: str) -> OffworkError:
     )
 
 
+def _validate_fixed_v1_payloads(
+    values: Dict[str, Dict[str, Any]], capsule_id: str
+) -> None:
+    def has_optional_string(value: Dict[str, Any], name: str) -> bool:
+        return name in value and (
+            value[name] is None or isinstance(value[name], str)
+        )
+
+    def is_optional_integer(value: Any) -> bool:
+        return value is None or (
+            isinstance(value, int) and not isinstance(value, bool)
+        )
+
+    capsule = values["capsule.json"]
+    task = capsule.get("task")
+    context = capsule.get("context")
+    observed = capsule.get("observed")
+    snapshot = capsule.get("workspace_snapshot")
+    if (
+        not isinstance(capsule.get("captured_at"), str)
+        or not isinstance(task, dict)
+        or not isinstance(task.get("task_id"), str)
+        or not isinstance(task.get("title"), str)
+        or not isinstance(task.get("goal"), str)
+        or not isinstance(task.get("captured_revision"), int)
+        or isinstance(task.get("captured_revision"), bool)
+        or not _has_fixed_v1_context_structure(context)
+        or not isinstance(observed, dict)
+        or not isinstance(observed.get("project_id"), str)
+        or not isinstance(observed.get("project_path"), str)
+        or not has_optional_string(observed, "git_root")
+        or not has_optional_string(observed, "branch")
+        or not has_optional_string(observed, "head")
+        or not _is_string_list(observed.get("changed_paths"))
+        or not isinstance(snapshot, dict)
+        or snapshot.get("schema_version") != "offwork.workspace/v1"
+        or not isinstance(snapshot.get("reliable"), bool)
+        or not isinstance(snapshot.get("project_id"), str)
+        or not isinstance(snapshot.get("project_path"), str)
+    ):
+        raise _integrity_error(capsule_id, "Capsule payload structure is invalid")
+
+    if snapshot["reliable"]:
+        entries = snapshot.get("entries")
+        if (
+            not isinstance(snapshot.get("git_root"), str)
+            or not isinstance(snapshot.get("project_is_git_root"), bool)
+            or not has_optional_string(snapshot, "branch")
+            or not has_optional_string(snapshot, "head")
+            or not isinstance(entries, dict)
+            or not _is_string_list(snapshot.get("changed_paths"))
+            or any(
+                not isinstance(path, str)
+                or not isinstance(entry, dict)
+                or not isinstance(entry.get("type"), str)
+                or "mode" not in entry
+                or not is_optional_integer(entry.get("mode"))
+                or "sha256" not in entry
+                or not (
+                    entry["sha256"] is None
+                    or isinstance(entry["sha256"], str)
+                )
+                for path, entry in (entries.items() if isinstance(entries, dict) else ())
+            )
+        ):
+            raise _integrity_error(
+                capsule_id, "Capsule workspace snapshot structure is invalid"
+            )
+    elif not isinstance(snapshot.get("reason"), str):
+        raise _integrity_error(
+            capsule_id, "Capsule workspace snapshot structure is invalid"
+        )
+
+    checks = values["checks.json"]
+    check_items = checks.get("checks")
+    if (
+        not isinstance(checks.get("status"), str)
+        or not isinstance(check_items, list)
+        or any(
+            not isinstance(check, dict)
+            or not isinstance(check.get("command"), str)
+            or not _is_string_list(check.get("argv"))
+            or not isinstance(check.get("cwd"), str)
+            or not isinstance(check.get("status"), str)
+            or "returncode" not in check
+            or not is_optional_integer(check.get("returncode"))
+            or not isinstance(check.get("started_at"), str)
+            or not isinstance(check.get("finished_at"), str)
+            for check in (check_items if isinstance(check_items, list) else ())
+        )
+    ):
+        raise _integrity_error(capsule_id, "Capsule checks structure is invalid")
+
+    restore = values["restore-test.json"]
+    if not isinstance(restore.get("status"), str):
+        raise _integrity_error(capsule_id, "Capsule restore structure is invalid")
+
+
+def _canonical_receipt_input(
+    values: Dict[str, Dict[str, Any]], capsule_id: str
+) -> Dict[str, Any]:
+    capsule = values["capsule.json"]
+    context = capsule["context"]
+    return {
+        "task": copy.deepcopy(capsule["task"]),
+        "capsule": {
+            "capsule_id": capsule["capsule_id"],
+            "captured_at": capsule["captured_at"],
+        },
+        "agent_claimed": {
+            "source": "capture_context",
+            "summary": context["summary"],
+            "items": copy.deepcopy(context["agent_claims"]),
+        },
+        "offwork_observed": copy.deepcopy(capsule["observed"]),
+        "auto_checked": copy.deepcopy(values["checks.json"]),
+        "unknowns": copy.deepcopy(context["unknowns"]),
+        "open_loops": copy.deepcopy(context["open_loops"]),
+        "next_step": context["next_step"],
+        "workspace_snapshot": copy.deepcopy(capsule["workspace_snapshot"]),
+    }
+
+
+def _read_private_member(path: Path, capsule_id: str, name: str) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise _integrity_error(
+            capsule_id, f"Capsule member {name} cannot be opened safely"
+        ) from exc
+    try:
+        current = os.fstat(descriptor)
+        if not stat.S_ISREG(current.st_mode):
+            raise _integrity_error(
+                capsule_id, f"Capsule member {name} is not a regular file"
+            )
+        if current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600:
+            raise _integrity_error(
+                capsule_id, f"Capsule member {name} permissions are unsafe"
+            )
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    except OSError as exc:
+        raise _integrity_error(capsule_id, f"Capsule member {name} cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _cleanup_staging(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
 def load_context(path: str) -> Dict[str, Any]:
     context_path = Path(path)
     try:
@@ -64,6 +267,13 @@ def load_context(path: str) -> Dict[str, Any]:
         ) from exc
     if not isinstance(value, dict):
         raise OffworkError("INVALID_CAPTURE_CONTEXT", "Capture context must be an object")
+    unknown_fields = set(value) - CAPTURE_CONTEXT_FIELD_SET
+    if unknown_fields:
+        raise OffworkError(
+            "INVALID_CAPTURE_CONTEXT",
+            "Capture context contains unknown fields",
+            details={"fields": sorted(unknown_fields)},
+        )
     required_strings = ("summary", "next_step")
     required_lists = ("agent_claims", "unknowns", "open_loops")
     if any(not isinstance(value.get(name), str) or not value[name].strip() for name in required_strings):
@@ -76,7 +286,14 @@ def load_context(path: str) -> Dict[str, Any]:
             "INVALID_CAPTURE_CONTEXT",
             "Capture context requires agent_claims, unknowns, and open_loops arrays",
         )
-    return value
+    if not _has_fixed_v1_context_structure(value):
+        raise OffworkError(
+            "INVALID_CAPTURE_CONTEXT",
+            "Capture context contains invalid nested values",
+        )
+    return {
+        name: copy.deepcopy(value[name]) for name in CAPTURE_CONTEXT_FIELDS
+    }
 
 
 def capture(
@@ -87,6 +304,28 @@ def capture(
     context = load_context(context_path)
     checks_value = run_checks(task["check_commands"], project["path"])
     workspace_snapshot = capture_workspace(project)
+    with state_lock(project["state_dir"]):
+        _reconcile_capsules_locked(project, task_id)
+        task = state.get_task(task_id)
+        return _capture_locked(
+            project,
+            state,
+            task,
+            context,
+            checks_value,
+            workspace_snapshot,
+        )
+
+
+def _capture_locked(
+    project: Dict[str, Any],
+    state: StateService,
+    task: Dict[str, Any],
+    context: Dict[str, Any],
+    checks_value: Dict[str, Any],
+    workspace_snapshot: Dict[str, Any],
+) -> str:
+    task_id = task["task_id"]
     capsule_id = f"capsule-{uuid.uuid4().hex}"
     captured_at = utc_now()
     captured_revision = task["revision"] + 1
@@ -113,7 +352,8 @@ def capture(
     }
     restore_value = {
         "schema_version": "offwork.restore-test/v1",
-        "status": "passed",
+        "status": "not_evaluated",
+        "authority": "descriptive_only",
     }
     payloads = {
         "capsule.json": _json_bytes(capsule_value),
@@ -134,9 +374,14 @@ def capture(
     manifest_payload = _json_bytes(manifest_value)
 
     capsules_dir = project["state_dir"] / "capsules"
+    validate_private_path(
+        capsules_dir,
+        expected_type="directory",
+        expected_mode=0o700,
+    )
     staging = capsules_dir / f".staging-{uuid.uuid4().hex}"
     final = capsules_dir / capsule_id
-    staging.mkdir(mode=0o700)
+    create_private_directory(staging)
     try:
         for name, payload in payloads.items():
             _write_private(staging / name, payload)
@@ -144,9 +389,18 @@ def capture(
         _fsync_directory(staging)
         os.rename(staging, final)
         _fsync_directory(capsules_dir)
+    except OffworkError:
+        _cleanup_staging(staging)
+        raise
+    except OSError as exc:
+        _cleanup_staging(staging)
+        raise OffworkError(
+            "CAPSULE_PUBLICATION_FAILED",
+            "Capsule could not be published safely",
+            details={"path": str(staging)},
+        ) from exc
     except Exception:
-        if staging.exists():
-            shutil.rmtree(staging)
+        _cleanup_staging(staging)
         raise
 
     state.register_capsule(
@@ -166,11 +420,13 @@ def _validated_archive_path(state_dir: Path, archive_path: str, capsule_id: str)
         raise _integrity_error(capsule_id, "Capsule archive path is invalid")
     directory = state_dir / relative
     try:
-        directory_mode = directory.lstat().st_mode
+        directory_stat = directory.lstat()
     except OSError as exc:
         raise _integrity_error(capsule_id, "Capsule directory is missing") from exc
-    if not stat.S_ISDIR(directory_mode) or stat.S_ISLNK(directory_mode):
+    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
         raise _integrity_error(capsule_id, "Capsule directory must be a real directory")
+    if directory_stat.st_uid != os.getuid() or stat.S_IMODE(directory_stat.st_mode) != 0o700:
+        raise _integrity_error(capsule_id, "Capsule directory permissions are unsafe")
     return directory
 
 
@@ -187,16 +443,7 @@ def _verify_directory(
     payload_bytes: Dict[str, bytes] = {}
     for name in CAPSULE_MEMBERS:
         path = directory / name
-        try:
-            mode = path.lstat().st_mode
-        except OSError as exc:
-            raise _integrity_error(capsule_id, f"Capsule member {name} is missing") from exc
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-            raise _integrity_error(capsule_id, f"Capsule member {name} is not a regular file")
-        try:
-            payload_bytes[name] = path.read_bytes()
-        except OSError as exc:
-            raise _integrity_error(capsule_id, f"Capsule member {name} cannot be read") from exc
+        payload_bytes[name] = _read_private_member(path, capsule_id, name)
 
     manifest_payload = payload_bytes["manifest.json"]
     manifest_hash = hashlib.sha256(manifest_payload).hexdigest()
@@ -206,12 +453,18 @@ def _verify_directory(
         manifest = json.loads(manifest_payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _integrity_error(capsule_id, "Manifest is not valid JSON") from exc
+    if not isinstance(manifest, dict):
+        raise _integrity_error(capsule_id, "Manifest must be a JSON object")
     if (
         manifest.get("schema_version") != "offwork.manifest/v1"
         or manifest.get("capsule_id") != capsule_id
-        or set(manifest.get("files", {})) != set(PAYLOAD_NAMES)
     ):
         raise _integrity_error(capsule_id, "Manifest schema or identity is invalid")
+    manifest_files = manifest.get("files")
+    if not isinstance(manifest_files, dict):
+        raise _integrity_error(capsule_id, "Manifest files must be a JSON object")
+    if set(manifest_files) != set(PAYLOAD_NAMES):
+        raise _integrity_error(capsule_id, "Manifest files do not match the fixed contract")
 
     values: Dict[str, Any] = {}
     expected_schemas = {
@@ -221,23 +474,37 @@ def _verify_directory(
     }
     for name in PAYLOAD_NAMES:
         payload = payload_bytes[name]
-        declared = manifest["files"].get(name, {})
+        declared = manifest_files[name]
+        if not isinstance(declared, dict):
+            raise _integrity_error(
+                capsule_id, f"Manifest declaration for {name} must be a JSON object"
+            )
         if declared.get("size") != len(payload) or declared.get("sha256") != hashlib.sha256(payload).hexdigest():
             raise _integrity_error(capsule_id, f"Capsule member {name} failed verification")
         try:
             value = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise _integrity_error(capsule_id, f"Capsule member {name} is invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise _integrity_error(capsule_id, f"Capsule member {name} must be a JSON object")
         if value.get("schema_version") != expected_schemas[name]:
             raise _integrity_error(capsule_id, f"Capsule member {name} has an unsupported schema")
         values[name] = value
     if values["capsule.json"].get("capsule_id") != capsule_id:
         raise _integrity_error(capsule_id, "Capsule payload identity does not match its directory")
+    _validate_fixed_v1_payloads(values, capsule_id)
+    receipt_input = _canonical_receipt_input(values, capsule_id)
     return {
         "capsule": values["capsule.json"],
         "checks": values["checks.json"],
         "restore": values["restore-test.json"],
         "manifest_hash": manifest_hash,
+        "receipt_input": receipt_input,
+        "handoff_verification": {
+            "integrity": {"status": "passed"},
+            "completeness": {"status": "complete", "missing_information": []},
+            "restore": {"status": "passed"},
+        },
     }
 
 
@@ -251,9 +518,16 @@ def load_capsule(
     return _verify_directory(directory, capsule_id, expected_manifest_hash)
 
 
-def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
+def _plan_capsule_reconciliation_locked(
+    project: Dict[str, Any], task_id: str
+) -> Dict[str, Any]:
     state = StateService(project["state_dir"])
+    task = state.get_task(task_id)
+    expected_revision = task["revision"]
+    next_revision = expected_revision + 1
     capsules_dir = project["state_dir"] / "capsules"
+    next_candidates: list[Dict[str, Any]] = []
+    skipped_candidates: list[Dict[str, Any]] = []
     for directory in capsules_dir.iterdir():
         capsule_id = directory.name
         if not capsule_id.startswith("capsule-") or state.capsule_registered(capsule_id):
@@ -266,17 +540,118 @@ def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
             continue
         capsule = loaded["capsule"]
         capsule_task = capsule.get("task", {})
-        if capsule_task.get("task_id") != task_id:
+        observed = capsule.get("observed", {})
+        if (
+            not isinstance(capsule_task, dict)
+            or capsule_task.get("task_id") != task_id
+            or not isinstance(observed, dict)
+            or observed.get("project_id") != project["project_id"]
+            or observed.get("project_path") != project["project_path"]
+            or not isinstance(capsule.get("captured_at"), str)
+            or not capsule["captured_at"]
+        ):
             continue
-        task = state.get_task(task_id)
         captured_revision = capsule_task.get("captured_revision")
-        if task["revision"] + 1 != captured_revision or task["current_capsule_id"] is not None:
+        if not isinstance(captured_revision, int) or isinstance(captured_revision, bool):
             continue
-        state.register_capsule(
-            capsule_id=capsule_id,
-            task_id=task_id,
-            archive_path=archive_path,
-            manifest_hash=loaded["manifest_hash"],
-            expected_revision=task["revision"],
-            created_at=capsule["captured_at"],
+        candidate = {
+            "capsule_id": capsule_id,
+            "archive_path": archive_path,
+            "manifest_hash": loaded["manifest_hash"],
+            "captured_revision": captured_revision,
+            "created_at": capsule["captured_at"],
+        }
+        if captured_revision == next_revision:
+            next_candidates.append(candidate)
+        elif captured_revision > next_revision:
+            skipped_candidates.append(candidate)
+
+    if skipped_candidates:
+        status = "gap"
+        candidates = skipped_candidates
+    elif len(next_candidates) > 1:
+        status = "ambiguous"
+        candidates = next_candidates
+    elif next_candidates:
+        status = "exact_next"
+        candidates = next_candidates
+    else:
+        status = "none"
+        candidates = []
+    return {
+        "status": status,
+        "task": task,
+        "expected_captured_revision": next_revision,
+        "candidates": candidates,
+    }
+
+
+def _require_no_pending_capsule_reconciliation_locked(
+    project: Dict[str, Any], task_id: str
+) -> None:
+    plan = _plan_capsule_reconciliation_locked(project, task_id)
+    if plan["status"] == "none":
+        return
+    raise OffworkError(
+        "CAPSULE_RECONCILIATION_REQUIRED",
+        (
+            "Published Capsules require reconciliation; run task show or resume, "
+            "then retry with the refreshed Task revision"
+        ),
+        details={
+            "task_id": task_id,
+            "reconciliation_status": plan["status"],
+            "expected_captured_revision": plan["expected_captured_revision"],
+            "candidate_capsule_ids": sorted(
+                candidate["capsule_id"] for candidate in plan["candidates"]
+            ),
+        },
+    )
+
+
+def reconcile_capsules(project: Dict[str, Any], task_id: str) -> None:
+    with state_lock(project["state_dir"]):
+        _reconcile_capsules_locked(project, task_id)
+
+
+def _reconcile_capsules_locked(project: Dict[str, Any], task_id: str) -> None:
+    plan = _plan_capsule_reconciliation_locked(project, task_id)
+    if plan["status"] == "gap":
+        raise OffworkError(
+            "CAPSULE_RECONCILIATION_GAP",
+            "Published Capsules skip the Task's next revision",
+            details={
+                "task_id": task_id,
+                "expected_captured_revision": plan["expected_captured_revision"],
+                "candidate_capsule_ids": sorted(
+                    candidate["capsule_id"] for candidate in plan["candidates"]
+                ),
+            },
         )
+    if plan["status"] == "ambiguous":
+        raise OffworkError(
+            "CAPSULE_RECONCILIATION_AMBIGUOUS",
+            "Multiple published Capsules claim the Task's next revision",
+            details={
+                "task_id": task_id,
+                "expected_captured_revision": plan["expected_captured_revision"],
+                "candidate_capsule_ids": sorted(
+                    candidate["capsule_id"] for candidate in plan["candidates"]
+                ),
+            },
+        )
+    if plan["status"] == "none":
+        return
+
+    candidate = plan["candidates"][0]
+    task = plan["task"]
+    StateService(project["state_dir"]).reconcile_capsule(
+        capsule_id=candidate["capsule_id"],
+        task_id=task_id,
+        archive_path=candidate["archive_path"],
+        manifest_hash=candidate["manifest_hash"],
+        captured_revision=candidate["captured_revision"],
+        expected_revision=task["revision"],
+        expected_current_capsule_id=task["current_capsule_id"],
+        created_at=candidate["created_at"],
+    )

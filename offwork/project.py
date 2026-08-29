@@ -10,10 +10,29 @@ from pathlib import Path
 from typing import Any, Dict
 
 from offwork.errors import OffworkError
-from offwork.state import initialize_database
+from offwork.state import (
+    PRIVATE_FILE_MODE,
+    create_private_directory,
+    initialize_database,
+    validate_database_paths,
+    validate_private_path,
+)
 
 
 STATE_DIR_NAME = ".offwork"
+GIT_OBSERVATION_TIMEOUT_SECONDS = 5.0
+
+
+class _GitObservationUnavailable(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _WorkspacePathUnavailable(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def canonical_project(path: str) -> Path:
@@ -27,49 +46,113 @@ def canonical_project(path: str) -> Path:
     return project
 
 
-def _reject_symlink(path: Path) -> None:
-    try:
-        mode = path.lstat().st_mode
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(mode):
-        raise OffworkError(
-            "UNSAFE_STATE_PATH",
-            "Offwork state paths must not be symlinks",
-            details={"path": str(path)},
-        )
-
-
 def _ensure_directory(path: Path, mode: int) -> None:
-    _reject_symlink(path)
-    existed = path.exists()
-    path.mkdir(mode=mode, exist_ok=True)
-    if not path.is_dir():
-        raise OffworkError(
-            "UNSAFE_STATE_PATH",
-            "Expected a private directory",
-            details={"path": str(path)},
-        )
-    current = path.stat()
-    if existed and (
-        current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != mode
-    ):
-        raise OffworkError(
-            "UNSAFE_STATE_PATH",
-            "Existing Offwork directory has unsafe owner or permissions",
-            details={"path": str(path)},
-        )
-    os.chmod(path, mode)
+    existing = validate_private_path(
+        path,
+        expected_type="directory",
+        expected_mode=mode,
+        required=False,
+    )
+    if existing is not None:
+        return
+    create_private_directory(path, mode)
+    validate_private_path(path, expected_type="directory", expected_mode=mode)
 
 
 def _write_private_json(path: Path, value: Dict[str, Any]) -> None:
     payload = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(descriptor, payload)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork project metadata could not be created safely",
+            details={"path": str(path)},
+        ) from exc
+    try:
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("project metadata write made no progress")
+            remaining = remaining[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _read_private_json(path: Path) -> Dict[str, Any]:
+    validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork project metadata could not be opened safely",
+            details={"path": str(path)},
+        ) from exc
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or stat.S_IMODE(current.st_mode) != PRIVATE_FILE_MODE
+        ):
+            raise OffworkError(
+                "UNSAFE_STATE_PATH",
+                "Offwork project metadata changed during validation",
+                details={"path": str(path)},
+            )
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = -1
+            value = json.load(stream)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(value, dict):
+        raise json.JSONDecodeError("project metadata must be an object", "", 0)
+    return value
+
+
+def _ensure_lock_file(path: Path) -> None:
+    existing = validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if existing is not None:
+        return
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+    except OSError as exc:
+        raise OffworkError(
+            "UNSAFE_STATE_PATH",
+            "Offwork lock file could not be created safely",
+            details={"path": str(path)},
+        ) from exc
+    try:
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+    finally:
+        os.close(descriptor)
+    validate_private_path(
+        path,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
 
 
 def initialize_project(path: str) -> Dict[str, Any]:
@@ -79,11 +162,16 @@ def initialize_project(path: str) -> Dict[str, Any]:
     _ensure_directory(state_dir / "capsules", 0o700)
 
     project_file = state_dir / "project.json"
-    _reject_symlink(project_file)
-    if project_file.exists():
+    existing_project_file = validate_private_path(
+        project_file,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if existing_project_file is not None:
         try:
-            metadata = json.loads(project_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            metadata = _read_private_json(project_file)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise OffworkError(
                 "INVALID_PROJECT_STATE",
                 "Existing project metadata is invalid",
@@ -104,10 +192,7 @@ def initialize_project(path: str) -> Dict[str, Any]:
         _write_private_json(project_file, metadata)
 
     lock_file = state_dir / "state.lock"
-    _reject_symlink(lock_file)
-    descriptor = os.open(lock_file, os.O_WRONLY | os.O_CREAT, 0o600)
-    os.close(descriptor)
-    os.chmod(lock_file, 0o600)
+    _ensure_lock_file(lock_file)
 
     initialize_database(state_dir / "state.sqlite3")
     return metadata
@@ -116,18 +201,39 @@ def initialize_project(path: str) -> Dict[str, Any]:
 def load_project(path: str) -> Dict[str, Any]:
     project = canonical_project(path)
     state_dir = project / STATE_DIR_NAME
-    _reject_symlink(state_dir)
     project_file = state_dir / "project.json"
-    _reject_symlink(project_file)
-    if not state_dir.is_dir() or not project_file.is_file():
+    state_exists = validate_private_path(
+        state_dir,
+        expected_type="directory",
+        expected_mode=0o700,
+        required=False,
+    )
+    project_exists = validate_private_path(
+        project_file,
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+        required=False,
+    )
+    if state_exists is None or project_exists is None:
         raise OffworkError(
             "PROJECT_NOT_INITIALIZED",
             "Project has not been initialized by Offwork",
             details={"project_path": str(project)},
         )
+    validate_private_path(
+        state_dir / "state.lock",
+        expected_type="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
+    validate_database_paths(state_dir / "state.sqlite3")
+    validate_private_path(
+        state_dir / "capsules",
+        expected_type="directory",
+        expected_mode=0o700,
+    )
     try:
-        metadata = json.loads(project_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        metadata = _read_private_json(project_file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OffworkError(
             "INVALID_PROJECT_STATE",
             "Project metadata is invalid",
@@ -145,14 +251,23 @@ def load_project(path: str) -> Dict[str, Any]:
 
 
 def _git(project: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["git", "-C", str(project), *arguments],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        shell=False,
-    )
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        return subprocess.run(
+            ["git", "-c", "core.fsmonitor=", "-C", str(project), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            shell=False,
+            timeout=GIT_OBSERVATION_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _GitObservationUnavailable("git_timeout") from exc
+    except OSError as exc:
+        raise _GitObservationUnavailable("git_unavailable") from exc
 
 
 def _metadata(project: Path, name: str, *arguments: str) -> str | None:
@@ -163,8 +278,22 @@ def _metadata(project: Path, name: str, *arguments: str) -> str | None:
     return value or None
 
 
+def _git_index_fingerprint(staged: subprocess.CompletedProcess[bytes], prefix: str) -> str:
+    digest = hashlib.sha256()
+    for record in staged.stdout.split(b"\0"):
+        _metadata_fields, separator, raw_path = record.partition(b"\t")
+        if not separator:
+            continue
+        relative = _project_relative(os.fsdecode(raw_path), prefix)
+        if relative is None:
+            continue
+        digest.update(len(record).to_bytes(8, "big"))
+        digest.update(record)
+    return digest.hexdigest()
+
+
 def _project_relative(repo_path: str, prefix: str) -> str | None:
-    normalized = repo_path.replace("\\", "/")
+    normalized = repo_path
     if prefix:
         marker = prefix.rstrip("/") + "/"
         if not normalized.startswith(marker):
@@ -175,7 +304,147 @@ def _project_relative(repo_path: str, prefix: str) -> str | None:
     return normalized
 
 
+def _snapshot_entry(project_descriptor: int, relative: str) -> Dict[str, Any]:
+    components = relative.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise _WorkspacePathUnavailable("unsafe_workspace_path")
+
+    try:
+        parent_descriptor = os.dup(project_descriptor)
+    except OSError as exc:
+        raise _WorkspacePathUnavailable("unsafe_workspace_path") from exc
+    try:
+        for component in components[:-1]:
+            try:
+                child_descriptor = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                return {"type": "missing", "mode": None, "sha256": None}
+            except OSError as exc:
+                raise _WorkspacePathUnavailable("unsafe_workspace_path") from exc
+            os.close(parent_descriptor)
+            parent_descriptor = child_descriptor
+
+        leaf = components[-1]
+        try:
+            path_stat = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"type": "missing", "mode": None, "sha256": None}
+        except OSError as exc:
+            raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+
+        mode = stat.S_IMODE(path_stat.st_mode)
+        if stat.S_ISLNK(path_stat.st_mode):
+            try:
+                target = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
+            except OSError as exc:
+                raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+            return {
+                "type": "symlink",
+                "mode": mode,
+                "sha256": hashlib.sha256(target).hexdigest(),
+            }
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise _WorkspacePathUnavailable("unsupported_path_type")
+
+        try:
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as exc:
+            raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+        try:
+            current = os.fstat(descriptor)
+            if not stat.S_ISREG(current.st_mode):
+                raise _WorkspacePathUnavailable("required_path_unreadable")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return {
+                "type": "file",
+                "mode": stat.S_IMODE(current.st_mode),
+                "sha256": digest.hexdigest(),
+            }
+        except OSError as exc:
+            raise _WorkspacePathUnavailable("required_path_unreadable") from exc
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _has_nested_git_repository(project: Path, project_is_git_root: bool) -> bool:
+    def unreadable(_error: OSError) -> None:
+        raise _WorkspacePathUnavailable("required_path_unreadable")
+
+    project_text = os.fspath(project)
+    for root, directories, files in os.walk(
+        project,
+        topdown=True,
+        onerror=unreadable,
+        followlinks=False,
+    ):
+        at_project_root = root == project_text
+        if at_project_root and ".offwork" in directories:
+            directories.remove(".offwork")
+        if ".git" not in directories and ".git" not in files:
+            continue
+        if at_project_root and project_is_git_root:
+            if ".git" in directories:
+                directories.remove(".git")
+            continue
+        return True
+    return False
+
+
 def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return _capture_workspace(project)
+    except _GitObservationUnavailable as exc:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": exc.reason,
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+
+
+def _capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
+    first = _capture_workspace_once(project)
+    if not first.get("reliable"):
+        return first
+    second = _capture_workspace_once(project)
+    if not second.get("reliable"):
+        return second
+    first_stability = dict(first)
+    second_stability = dict(second)
+    if not first.get("project_is_git_root") and not second.get("project_is_git_root"):
+        for metadata in (first_stability, second_stability):
+            metadata.pop("branch", None)
+            metadata.pop("head", None)
+    if first_stability != second_stability:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "unstable_workspace_scan",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    stable = dict(second)
+    stable.pop("_git_scan_fingerprint", None)
+    return stable
+
+
+def _capture_workspace_once(project: Dict[str, Any]) -> Dict[str, Any]:
     project_path: Path = project["path"]
     root_text = _metadata(project_path, "root", "rev-parse", "--show-toplevel")
     if root_text is None:
@@ -198,7 +467,29 @@ def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
             "project_path": project["project_path"],
         }
     prefix = "" if relative_prefix == "." else relative_prefix
-    pathspec = "." if not prefix else prefix
+    pathspec = ":(top,literal)" + prefix
+
+    try:
+        has_nested_git_repository = _has_nested_git_repository(
+            project_path,
+            project_path == git_root,
+        )
+    except _WorkspacePathUnavailable as exc:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": exc.reason,
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    if has_nested_git_repository:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "nested_git_repository",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
 
     staged = _git(git_root, "ls-files", "--stage", "-z", "--", pathspec)
     listed = _git(
@@ -230,51 +521,38 @@ def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
             }
 
     entries: Dict[str, Dict[str, Any]] = {}
-    for raw_path in listed.stdout.split(b"\0"):
-        if not raw_path:
-            continue
-        repo_path = os.fsdecode(raw_path)
-        relative = _project_relative(repo_path, prefix)
-        if relative is None:
-            continue
-        absolute = project_path / relative
-        try:
-            path_stat = absolute.lstat()
-        except FileNotFoundError:
-            entries[relative] = {"type": "missing", "mode": None, "sha256": None}
-            continue
-        mode = stat.S_IMODE(path_stat.st_mode)
-        if stat.S_ISLNK(path_stat.st_mode):
-            target = os.fsencode(os.readlink(absolute))
-            entries[relative] = {
-                "type": "symlink",
-                "mode": mode,
-                "sha256": hashlib.sha256(target).hexdigest(),
-            }
-        elif stat.S_ISREG(path_stat.st_mode):
-            try:
-                content = absolute.read_bytes()
-            except OSError:
-                return {
-                    "schema_version": "offwork.workspace/v1",
-                    "reliable": False,
-                    "reason": "required_path_unreadable",
-                    "project_id": project["project_id"],
-                    "project_path": project["project_path"],
-                }
-            entries[relative] = {
-                "type": "file",
-                "mode": mode,
-                "sha256": hashlib.sha256(content).hexdigest(),
-            }
-        else:
-            return {
-                "schema_version": "offwork.workspace/v1",
-                "reliable": False,
-                "reason": "unsupported_path_type",
-                "project_id": project["project_id"],
-                "project_path": project["project_path"],
-            }
+    try:
+        project_descriptor = os.open(
+            project_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "unsafe_workspace_path",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    try:
+        for raw_path in listed.stdout.split(b"\0"):
+            if not raw_path:
+                continue
+            repo_path = os.fsdecode(raw_path)
+            relative = _project_relative(repo_path, prefix)
+            if relative is None:
+                continue
+            entries[relative] = _snapshot_entry(project_descriptor, relative)
+    except _WorkspacePathUnavailable as exc:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": exc.reason,
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    finally:
+        os.close(project_descriptor)
 
     status_result = _git(
         git_root,
@@ -285,14 +563,21 @@ def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
         "--",
         pathspec,
     )
+    if status_result.returncode != 0:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "git_scan_failed",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
     changed_paths = []
-    if status_result.returncode == 0:
-        for record in status_result.stdout.split(b"\0"):
-            if len(record) < 4:
-                continue
-            relative = _project_relative(os.fsdecode(record[3:]), prefix)
-            if relative is not None:
-                changed_paths.append(relative)
+    for record in status_result.stdout.split(b"\0"):
+        if len(record) < 4:
+            continue
+        relative = _project_relative(os.fsdecode(record[3:]), prefix)
+        if relative is not None:
+            changed_paths.append(relative)
 
     branch = _metadata(project_path, "branch", "symbolic-ref", "--short", "-q", "HEAD")
     head = _metadata(project_path, "head", "rev-parse", "HEAD")
@@ -307,6 +592,7 @@ def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
         "head": head,
         "entries": entries,
         "changed_paths": sorted(set(changed_paths)),
+        "_git_scan_fingerprint": _git_index_fingerprint(staged, prefix),
     }
 
 
@@ -325,6 +611,15 @@ def compare_workspace(captured: Dict[str, Any], current: Dict[str, Any]) -> Dict
             "status": "unavailable",
             "changes": [],
             "limitations": ["project_identity_mismatch"],
+        }
+    if (
+        captured.get("git_root") != current.get("git_root")
+        or captured.get("project_is_git_root") != current.get("project_is_git_root")
+    ):
+        return {
+            "status": "unavailable",
+            "changes": [],
+            "limitations": ["git_boundary_changed"],
         }
     captured_entries = captured.get("entries", {})
     current_entries = current.get("entries", {})

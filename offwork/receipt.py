@@ -8,21 +8,29 @@ from offwork.state import StateService, utc_now
 
 
 def build_receipt(
-    project: Dict[str, Any], task_id: str, capsule_id: Optional[str] = None
+    project: Dict[str, Any],
+    task_id: str,
+    capsule_id: Optional[str] = None,
+    *,
+    reconcile_orphans: bool = True,
 ) -> Dict[str, Any]:
-    reconcile_capsules(project, task_id)
+    if reconcile_orphans:
+        reconcile_capsules(project, task_id)
     state = StateService(project["state_dir"])
-    task = state.get_task(task_id)
-    capsule_row = state.get_capsule(task_id, capsule_id)
+    receipt_state = state.get_receipt_state(task_id, capsule_id)
+    task = receipt_state["task"]
+    capsule_row = receipt_state["capsule"]
     loaded = load_capsule(
         project["state_dir"],
         capsule_row["archive_path"],
         capsule_row["capsule_id"],
         capsule_row["manifest_hash"],
     )
-    capsule = loaded["capsule"]
-    context = capsule["context"]
-    comparison = compare_workspace(capsule["workspace_snapshot"], capture_workspace(project))
+    receipt_input = loaded["receipt_input"]
+    capsule = receipt_input["capsule"]
+    comparison = compare_workspace(
+        receipt_input["workspace_snapshot"], capture_workspace(project)
+    )
     return {
         "schema_version": "offwork.receipt/v1",
         "task": {
@@ -36,21 +44,13 @@ def build_receipt(
             "capsule_id": capsule["capsule_id"],
             "captured_at": capsule["captured_at"],
         },
-        "agent_claimed": {
-            "source": "capture_context",
-            "summary": context["summary"],
-            "items": context["agent_claims"],
-        },
-        "offwork_observed": capsule["observed"],
-        "auto_checked": loaded["checks"],
-        "handoff_verified": {
-            "integrity": {"status": "passed"},
-            "completeness": {"status": "complete", "missing_information": []},
-            "restore": {"status": loaded["restore"]["status"]},
-        },
-        "unknowns": context["unknowns"],
-        "open_loops": context["open_loops"],
-        "next_step": context["next_step"],
+        "agent_claimed": receipt_input["agent_claimed"],
+        "offwork_observed": receipt_input["offwork_observed"],
+        "auto_checked": receipt_input["auto_checked"],
+        "handoff_verified": loaded["handoff_verification"],
+        "unknowns": receipt_input["unknowns"],
+        "open_loops": receipt_input["open_loops"],
+        "next_step": receipt_input["next_step"],
         "workspace_freshness": {
             "status": comparison["status"],
             "scope": "explicit_git_project",
@@ -58,5 +58,5 @@ def build_receipt(
             "changes": comparison["changes"],
             "limitations": comparison["limitations"],
         },
-        "human_acceptance": state.get_acceptance(capsule["capsule_id"]),
+        "human_acceptance": receipt_state["acceptance"],
     }

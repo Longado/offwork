@@ -1,0 +1,67 @@
+{
+  "schema_version": "offwork.history-free-run/v1",
+  "status": "completed",
+  "case_id": "stop",
+  "agent": "Codex fresh sub-agent /root/history_free_stop_v3",
+  "commands": [
+    {
+      "purpose": "Produce the exact CLI JSON envelope supplied to the fresh Agent.",
+      "argv": [
+        "/Users/eddie/Documents/WAIC/offwork/.worktrees/prototype-vertical-slice/bin/offwork",
+        "resume",
+        "--task",
+        "task-c266afb968954bfbac73ad370ccc2b41",
+        "--capsule",
+        "capsule-0b82120a72b24816b522b766e771682a",
+        "--project",
+        "/Users/eddie/Documents/WAIC/offwork/.worktrees/.offwork-agent-work/2026-08-29-prototype-vertical-slice/history-free/run-20260829T074910Z/stop/project",
+        "--json"
+      ],
+      "elapsed_ms": 63,
+      "exit_code": 2
+    }
+  ],
+  "overall_elapsed_ms": 146097,
+  "cli_json_envelope": {
+    "command": "resume",
+    "error": {
+      "code": "CAPSULE_INTEGRITY_FAILED",
+      "details": {
+        "capsule_id": "capsule-0b82120a72b24816b522b766e771682a",
+        "freshness": "not_evaluated",
+        "integrity": "failed"
+      },
+      "message": "Manifest hash does not match registered state"
+    },
+    "ok": false,
+    "schema_version": "offwork.cli/v1"
+  },
+  "response": {
+    "decision": "stop",
+    "cited_receipt_facts": [
+      {
+        "receipt_path": "$.error.code",
+        "value": "CAPSULE_INTEGRITY_FAILED",
+        "relevance": "The Capsule failed its integrity trust boundary, preventing a safe decision."
+      },
+      {
+        "receipt_path": "$.error.details.integrity",
+        "value": "failed",
+        "relevance": "Integrity status explicitly confirms the failure."
+      },
+      {
+        "receipt_path": "$.error.details.freshness",
+        "value": "not_evaluated",
+        "relevance": "Workspace freshness was not evaluated, so no trusted freshness result is available."
+      }
+    ],
+    "proposed_first_action": {
+      "mode": "none",
+      "value": null,
+      "receipt_path": null,
+      "reason": "A newly generated or repaired Capsule with verified integrity and an evaluated workspace freshness result is required before a safe decision can be made."
+    }
+  },
+  "result": "passed",
+  "note": "Real history-free Agent run. Exact CLI envelope and Agent response preserved; HEAD, Git index, project files, and human acceptance remained unchanged."
+}

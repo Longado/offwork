@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 import sys
 import unittest
+from pathlib import Path
 
 from tests.helpers import TempProject
 
@@ -18,10 +19,7 @@ class FiveMinutePrototypeTests(unittest.TestCase):
     def test_complete_handoff_receipt_story(self) -> None:
         initialized = self.temp.init()
         self.assertRegex(initialized["project_id"], r"^project-")
-        check = (
-            f"{shlex.quote(sys.executable)} -c \"from pathlib import Path; "
-            "assert Path('tracked.txt').exists()\""
-        )
+        check = f"{shlex.quote(sys.executable)} -c \"assert False, 'controlled failure'\""
         task = self.temp.add_task(checks=[check])
         sentinel = self.temp.project / "next-step-was-executed"
         context = {
@@ -47,7 +45,7 @@ class FiveMinutePrototypeTests(unittest.TestCase):
         captured = self.temp.json_stdout(capture)["data"]
         capsule_id = captured["capsule"]["capsule_id"]
         self.assertEqual(captured["agent_claimed"]["items"], context["agent_claims"])
-        self.assertEqual(captured["auto_checked"]["status"], "passed")
+        self.assertEqual(captured["auto_checked"]["status"], "failed")
         self.assertEqual(captured["unknowns"], context["unknowns"])
         self.assertEqual(captured["open_loops"], context["open_loops"])
         self.assertEqual(captured["workspace_freshness"]["status"], "fresh")
@@ -91,7 +89,7 @@ class FiveMinutePrototypeTests(unittest.TestCase):
         self.assertIn("Observed by Offwork:", human.stdout)
         self.assertIn(str(self.temp.project.resolve()), human.stdout)
         self.assertIn("tracked.txt", human.stdout)
-        self.assertIn("Checks: passed", human.stdout)
+        self.assertIn("Checks: failed", human.stdout)
         self.assertIn(check, human.stdout)
         for fact in (
             capsule_id,
@@ -103,6 +101,19 @@ class FiveMinutePrototypeTests(unittest.TestCase):
             "accepted",
         ):
             self.assertIn(fact, human.stdout)
+
+    def test_readme_demo_is_copy_pasteable_and_shows_claim_check_contradiction(self) -> None:
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("cat > \"$DEMO_PROJECT/context.json\" <<'JSON'", readme)
+        self.assertIn("CHECK_STATUS", readme)
+        self.assertIn("assert False", readme)
+        self.assertIn('"测试全部通过"', readme)
+        self.assertNotIn("OFFWORK=/absolute/path", readme)
+        self.assertNotIn("--task TASK_ID", readme)
+        self.assertNotIn("--capsule CAPSULE_ID", readme)
 
 
 if __name__ == "__main__":
