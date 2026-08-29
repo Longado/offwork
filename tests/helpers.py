@@ -40,8 +40,9 @@ class TempProject:
         self,
         title: str = "修复登录失败",
         goal: str = "恢复 Token 刷新行为",
+        checks: list[str] | None = None,
     ) -> Dict[str, Any]:
-        result = self.run(
+        arguments = [
             "task",
             "add",
             title,
@@ -50,7 +51,10 @@ class TempProject:
             "--project",
             str(self.project),
             "--json",
-        )
+        ]
+        for check in checks or []:
+            arguments.extend(["--check", check])
+        result = self.run(*arguments)
         if result.returncode != 0:
             raise AssertionError(result.stderr or result.stdout)
         return self.json_stdout(result)["data"]
@@ -59,6 +63,22 @@ class TempProject:
         path = self.root / name
         path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         return path
+
+    def init_git(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "config", "user.email", "offwork@example.test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.project), "config", "user.name", "Offwork Tests"],
+            check=True,
+        )
+        (self.project / "tracked.txt").write_text("captured\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "tracked.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "commit", "-qm", "initial"], check=True
+        )
 
     @staticmethod
     def json_stdout(result: subprocess.CompletedProcess[str]) -> dict:

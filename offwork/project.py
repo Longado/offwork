@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import stat
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Dict
@@ -130,3 +132,202 @@ def load_project(path: str) -> Dict[str, Any]:
     metadata["path"] = project
     metadata["state_dir"] = state_dir
     return metadata
+
+
+def _git(project: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(project), *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        shell=False,
+    )
+
+
+def _metadata(project: Path, name: str, *arguments: str) -> str | None:
+    result = _git(project, *arguments)
+    if result.returncode != 0:
+        return None
+    value = os.fsdecode(result.stdout).strip()
+    return value or None
+
+
+def _project_relative(repo_path: str, prefix: str) -> str | None:
+    normalized = repo_path.replace("\\", "/")
+    if prefix:
+        marker = prefix.rstrip("/") + "/"
+        if not normalized.startswith(marker):
+            return None
+        normalized = normalized[len(marker) :]
+    if not normalized or normalized == ".offwork" or normalized.startswith(".offwork/"):
+        return None
+    return normalized
+
+
+def capture_workspace(project: Dict[str, Any]) -> Dict[str, Any]:
+    project_path: Path = project["path"]
+    root_text = _metadata(project_path, "root", "rev-parse", "--show-toplevel")
+    if root_text is None:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "git_unavailable",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    git_root = Path(root_text).resolve()
+    try:
+        relative_prefix = project_path.relative_to(git_root).as_posix()
+    except ValueError:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "project_outside_git_root",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    prefix = "" if relative_prefix == "." else relative_prefix
+    pathspec = "." if not prefix else prefix
+
+    staged = _git(git_root, "ls-files", "--stage", "-z", "--", pathspec)
+    listed = _git(
+        git_root,
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+        pathspec,
+    )
+    if staged.returncode != 0 or listed.returncode != 0:
+        return {
+            "schema_version": "offwork.workspace/v1",
+            "reliable": False,
+            "reason": "git_scan_failed",
+            "project_id": project["project_id"],
+            "project_path": project["project_path"],
+        }
+    for record in staged.stdout.split(b"\0"):
+        if record.startswith(b"160000 "):
+            return {
+                "schema_version": "offwork.workspace/v1",
+                "reliable": False,
+                "reason": "gitlink_unsupported",
+                "project_id": project["project_id"],
+                "project_path": project["project_path"],
+            }
+
+    entries: Dict[str, Dict[str, Any]] = {}
+    for raw_path in listed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        repo_path = os.fsdecode(raw_path)
+        relative = _project_relative(repo_path, prefix)
+        if relative is None:
+            continue
+        absolute = project_path / relative
+        try:
+            path_stat = absolute.lstat()
+        except FileNotFoundError:
+            entries[relative] = {"type": "missing", "mode": None, "sha256": None}
+            continue
+        mode = stat.S_IMODE(path_stat.st_mode)
+        if stat.S_ISLNK(path_stat.st_mode):
+            target = os.fsencode(os.readlink(absolute))
+            entries[relative] = {
+                "type": "symlink",
+                "mode": mode,
+                "sha256": hashlib.sha256(target).hexdigest(),
+            }
+        elif stat.S_ISREG(path_stat.st_mode):
+            try:
+                content = absolute.read_bytes()
+            except OSError:
+                return {
+                    "schema_version": "offwork.workspace/v1",
+                    "reliable": False,
+                    "reason": "required_path_unreadable",
+                    "project_id": project["project_id"],
+                    "project_path": project["project_path"],
+                }
+            entries[relative] = {
+                "type": "file",
+                "mode": mode,
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        else:
+            return {
+                "schema_version": "offwork.workspace/v1",
+                "reliable": False,
+                "reason": "unsupported_path_type",
+                "project_id": project["project_id"],
+                "project_path": project["project_path"],
+            }
+
+    status_result = _git(
+        git_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        pathspec,
+    )
+    changed_paths = []
+    if status_result.returncode == 0:
+        for record in status_result.stdout.split(b"\0"):
+            if len(record) < 4:
+                continue
+            relative = _project_relative(os.fsdecode(record[3:]), prefix)
+            if relative is not None:
+                changed_paths.append(relative)
+
+    branch = _metadata(project_path, "branch", "symbolic-ref", "--short", "-q", "HEAD")
+    head = _metadata(project_path, "head", "rev-parse", "HEAD")
+    return {
+        "schema_version": "offwork.workspace/v1",
+        "reliable": True,
+        "project_id": project["project_id"],
+        "project_path": project["project_path"],
+        "git_root": str(git_root),
+        "project_is_git_root": project_path == git_root,
+        "branch": branch,
+        "head": head,
+        "entries": entries,
+        "changed_paths": sorted(set(changed_paths)),
+    }
+
+
+def compare_workspace(captured: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    if not captured.get("reliable") or not current.get("reliable"):
+        return {
+            "status": "unavailable",
+            "changes": [],
+            "limitations": [captured.get("reason") or current.get("reason") or "snapshot_unavailable"],
+        }
+    if (
+        captured.get("project_id") != current.get("project_id")
+        or captured.get("project_path") != current.get("project_path")
+    ):
+        return {
+            "status": "unavailable",
+            "changes": [],
+            "limitations": ["project_identity_mismatch"],
+        }
+    captured_entries = captured.get("entries", {})
+    current_entries = current.get("entries", {})
+    changes = sorted(
+        path
+        for path in set(captured_entries) | set(current_entries)
+        if captured_entries.get(path) != current_entries.get(path)
+    )
+    if captured.get("project_is_git_root"):
+        if captured.get("head") != current.get("head") or captured.get("branch") != current.get("branch"):
+            changes.insert(0, "@git")
+    return {
+        "status": "changed" if changes else "fresh",
+        "changes": changes,
+        "limitations": ["ignored files and external state are not checked"],
+    }

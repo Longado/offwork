@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+import sys
 import unittest
 
 from tests.helpers import TempProject
@@ -129,6 +131,77 @@ class TaskCreationTests(unittest.TestCase):
         self.assertEqual(task["title"], "修复登录失败")
         self.assertEqual(task["goal"], "恢复 Token 刷新行为")
         self.assertEqual(task["revision"], 1)
+
+
+class CheckRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = TempProject()
+        self.temp.init_git()
+        self.temp.init()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def capture_with_checks(self, checks: list[str]) -> tuple[dict, object]:
+        task = self.temp.add_task(checks=checks)
+        path = self.temp.write_context(CONTEXT)
+        result = self.temp.run(
+            "capture",
+            "--task",
+            task["task_id"],
+            "--context",
+            str(path),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        return self.temp.json_stdout(result)["data"], result
+
+    def test_all_checks_must_run_and_pass(self) -> None:
+        command = (
+            f"{shlex.quote(sys.executable)} -c \"print(''.join(map(chr, "
+            "[76,69,65,75,95,83,69,78,84,73,78,69,76])))\""
+        )
+        receipt, result = self.capture_with_checks([command])
+
+        self.assertEqual(receipt["auto_checked"]["status"], "passed")
+        check = receipt["auto_checked"]["checks"][0]
+        self.assertEqual(check["argv"][:2], [sys.executable, "-c"])
+        self.assertEqual(check["cwd"], str(self.temp.project.resolve()))
+        self.assertEqual(check["returncode"], 0)
+        self.assertNotIn("LEAK_SENTINEL", result.stdout)
+
+    def test_nonzero_check_is_failed_even_when_another_check_passes(self) -> None:
+        passed = f"{shlex.quote(sys.executable)} -c \"pass\""
+        failed = f"{shlex.quote(sys.executable)} -c \"import sys; sys.exit(7)\""
+        receipt, _ = self.capture_with_checks([passed, failed])
+
+        self.assertEqual(receipt["auto_checked"]["status"], "failed")
+        self.assertEqual([item["status"] for item in receipt["auto_checked"]["checks"]], ["passed", "failed"])
+
+    def test_spawn_error_makes_checks_unavailable(self) -> None:
+        receipt, _ = self.capture_with_checks(["offwork-command-that-does-not-exist"])
+
+        self.assertEqual(receipt["auto_checked"]["status"], "unavailable")
+        self.assertEqual(receipt["auto_checked"]["checks"][0]["status"], "unavailable")
+
+    def test_timeout_makes_checks_unavailable(self) -> None:
+        command = f"{shlex.quote(sys.executable)} -c \"import time; time.sleep(5)\""
+        receipt, _ = self.capture_with_checks([command])
+
+        self.assertEqual(receipt["auto_checked"]["status"], "unavailable")
+        self.assertEqual(receipt["auto_checked"]["checks"][0]["status"], "unavailable")
+
+    def test_snapshot_is_collected_after_check_changes_project(self) -> None:
+        command = (
+            f"{shlex.quote(sys.executable)} -c \"from pathlib import Path; "
+            "Path('tracked.txt').write_text('changed by check\\n')\""
+        )
+        receipt, _ = self.capture_with_checks([command])
+
+        self.assertEqual(receipt["auto_checked"]["status"], "passed")
+        self.assertEqual(receipt["workspace_freshness"]["status"], "fresh")
 
 
 if __name__ == "__main__":

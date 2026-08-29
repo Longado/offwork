@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 from offwork.errors import OffworkError
+from offwork.checks import run_checks
+from offwork.project import capture_workspace
 from offwork.state import StateService, utc_now
 
 
@@ -61,6 +63,8 @@ def capture(
     state = StateService(project["state_dir"])
     task = state.get_task(task_id)
     context = load_context(context_path)
+    checks_value = run_checks(task["check_commands"], project["path"])
+    workspace_snapshot = capture_workspace(project)
     capsule_id = f"capsule-{uuid.uuid4().hex}"
     captured_at = utc_now()
     captured_revision = task["revision"] + 1
@@ -78,17 +82,12 @@ def capture(
         "observed": {
             "project_id": project["project_id"],
             "project_path": project["project_path"],
-            "git_root": None,
-            "branch": None,
-            "head": None,
-            "changed_paths": [],
+            "git_root": workspace_snapshot.get("git_root"),
+            "branch": workspace_snapshot.get("branch"),
+            "head": workspace_snapshot.get("head"),
+            "changed_paths": workspace_snapshot.get("changed_paths", []),
         },
-        "workspace_snapshot": None,
-    }
-    checks_value = {
-        "schema_version": "offwork.checks/v1",
-        "status": "not_run",
-        "checks": [],
+        "workspace_snapshot": workspace_snapshot,
     }
     restore_value = {
         "schema_version": "offwork.restore-test/v1",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from offwork.capsule import load_capsule
+from offwork.project import capture_workspace, compare_workspace
 from offwork.state import StateService, utc_now
 
 
@@ -15,6 +16,7 @@ def build_receipt(
     loaded = load_capsule(project["state_dir"], capsule_row["archive_path"])
     capsule = loaded["capsule"]
     context = capsule["context"]
+    comparison = compare_workspace(capsule["workspace_snapshot"], capture_workspace(project))
     return {
         "schema_version": "offwork.receipt/v1",
         "task": {
@@ -44,11 +46,11 @@ def build_receipt(
         "open_loops": context["open_loops"],
         "next_step": context["next_step"],
         "workspace_freshness": {
-            "status": "unavailable",
+            "status": comparison["status"],
             "scope": "explicit_git_project",
             "checked_at": utc_now(),
-            "changes": [],
-            "limitations": ["workspace snapshot is not implemented in this slice"],
+            "changes": comparison["changes"],
+            "limitations": comparison["limitations"],
         },
         "human_acceptance": {"status": "pending", "acted_at": None, "note": None},
     }
