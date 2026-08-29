@@ -4,6 +4,8 @@ Offwork 把长期任务、Agent Session、项目现场、可检索历史和可�
 
 V0.2 只依赖 Python 标准库，默认数据留在本机。它不会替你 commit、stash、push，也不会自动执行历史命令或所谓的“下一步”。
 
+下一阶段将围绕“跨 Session、跨 Agent 的可信交接”强化交接审计 Receipt、Evidence / Unknowns、Workspace freshness 和显式人工验收。产品 Storyline、状态边界与结构草案见 [可信交接 Storyline 与设计框架](docs/handoff-receipt-design.md)。
+
 ## 直接运行
 
 ```bash
