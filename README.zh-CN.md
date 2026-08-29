@@ -35,6 +35,23 @@ Loop 6 的干净克隆验证运行于 macOS 26.4.1 arm64、Python 3.9.6 和 Appl
 
 前两张图会同时保留 Agent 的说法和 Offwork 实际运行检查得到的结果。第三张图显示：项目发生变化时，Capsule integrity 仍保持 `passed`，workspace freshness 会独立变为 `changed`。第四张图把人工决定、时间和备注绑定到对应的 Capsule 与 Task revision。
 
+## Codex 插件
+
+安装仓库 marketplace 和插件：
+
+```bash
+codex plugin marketplace add Longado/offwork --ref main
+codex plugin add offwork-capsule@offwork
+```
+
+重启 Codex 后，只需输入一条指令：
+
+```text
+$offwork capture
+```
+
+使用 `$offwork resume <task-id>` 可以重新打开交接。Offwork skill 也会出现在斜杠命令列表中：输入 `/`，然后选择 **Offwork**。
+
 ## 架构
 
 Offwork Capsule 关注的是“交接是否可信”，而不是替用户调度 Agent。执行 `capture` 时，它只收集用户提供的 context、用户授权的检查结果，以及指定 Git 项目的现场快照。执行 `resume` 时，它会从已发布的 Capsule 重新生成 Receipt，再单独比较当前工作区有没有变化。

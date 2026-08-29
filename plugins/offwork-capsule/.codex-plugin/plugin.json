@@ -1,0 +1,24 @@
+{
+  "name": "offwork-capsule",
+  "version": "0.1.0",
+  "description": "Capture and resume trustworthy Agent handoffs from Codex.",
+  "author": {
+    "name": "Longado"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Offwork Capsule",
+    "shortDescription": "Package current work into a trusted Capsule.",
+    "longDescription": "Capture a structured, auditable handoff from the current Codex workspace and resume it in a fresh Agent Session.",
+    "developerName": "Longado",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $offwork capture to package the current work into a trusted handoff.",
+      "Use $offwork resume to continue from an existing Offwork Capsule."
+    ]
+  }
+}

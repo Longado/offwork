@@ -1,0 +1,4 @@
+interface:
+  display_name: "Offwork"
+  short_description: "Capture or resume a trusted Agent handoff."
+  default_prompt: "Use $offwork capture to package the current work into a trusted handoff."
