@@ -1,6 +1,14 @@
-# Offwork
+# Offwork Capsule
+
+> Trustworthy handoffs for work across Agent sessions.
+>
+> 为跨 Session、跨 Agent 的工作提供可信、可审计、可恢复的交接。
+
+[English](./README.md) · [简体中文](./README.zh-CN.md)
 
 Offwork creates trustworthy, auditable, recoverable handoffs for local work that crosses Agent Sessions.
+
+Capture the current project into an immutable Capsule. Let a fresh Agent Session resume from evidence—not chat history.
 
 It does not prove that an Agent is correct. It gives the next Agent and the user a structured Receipt showing:
 
@@ -16,6 +24,53 @@ It does not prove that an Agent is correct. It gives the next Agent and the user
 Offwork is a Python 3.9+ standard-library CLI. It requires system Git and has no production package dependencies.
 
 The Loop 6 clean-clone proof was run on macOS 26.4.1 arm64 with Python 3.9.6 and Apple Git 2.50.1. The CLI targets POSIX process behavior; Linux is intended but was not independently verified in that run, and Windows support is not claimed.
+
+## Architecture
+
+Offwork Capsule is organized around a trust flow, not an Agent orchestration loop. Capture collects only the explicit context, authorized checks, and explicit Git project snapshot. Resume rebuilds a Receipt from the published Capsule and compares that evidence with the current workspace.
+
+```mermaid
+flowchart LR
+    A[User or Agent] --> B[offwork CLI]
+    B --> C[Capture pipeline]
+
+    C --> D[Structured context]
+    C --> E[Authorized checks]
+    C --> F[Git workspace snapshot]
+
+    D --> G[Immutable Capsule]
+    E --> G
+    F --> G
+
+    G --> H[Integrity and restore verification]
+    I[Current Git workspace] --> J[Freshness comparison]
+
+    H --> K[Handoff Receipt]
+    J --> K
+    L[(SQLite state)] --> K
+
+    K --> M[Fresh Agent Session]
+    N[Explicit accept or reject] --> L
+```
+
+The arrows do not collapse the evidence into one optimistic status:
+
+- Agent claims remain text supplied at capture time.
+- Offwork checks report only commands it actually attempted.
+- Capsule integrity and workspace freshness are evaluated independently.
+- `resume` renders evidence and never executes the next step.
+- Human acceptance changes only after an explicit accept or reject command.
+
+## Technical stack
+
+| Layer | Technology | Purpose |
+| --- | --- | --- |
+| Core CLI | Python 3.9+ standard library | Commands, validation, Receipt rendering, and stable JSON envelopes |
+| Project evidence | System Git CLI | Explicit project identity, branch, HEAD, changed paths, and workspace freshness |
+| Local state | SQLite | Task revisions, Capsule registration, and human acceptance events |
+| Capsule integrity | JSON and SHA-256 manifests | Fixed Capsule members, content hashes, and restore-time verification |
+| Check execution | `subprocess` with argv and `shell=False` | Authorized checks with bounded output, budgets, timeouts, and POSIX process-group cleanup |
+| Verification | `unittest`, `compileall`, and clean-clone demos | Lifecycle, failure, tamper, recovery, and history-free Agent evidence |
 
 ## Prototype status
 
