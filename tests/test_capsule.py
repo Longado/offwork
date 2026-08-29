@@ -346,6 +346,142 @@ class CapsuleCaptureTests(unittest.TestCase):
                     "INVALID_CAPTURE_CONTEXT",
                 )
 
+    def test_unknown_context_fields_are_rejected_before_checks_or_publication(self) -> None:
+        cases = [
+            ("transcript", {"transcript": "full session transcript"}),
+            ("arbitrary extra", {"extra": {"caller": "object"}}),
+        ]
+        database = self.temp.project / ".offwork" / "state.sqlite3"
+        capsules = self.temp.project / ".offwork" / "capsules"
+
+        for number, (name, extra) in enumerate(cases):
+            with self.subTest(name=name):
+                sentinel_name = f"unknown-context-check-{number}.txt"
+                command = (
+                    f"{shlex.quote(sys.executable)} -c \"from pathlib import Path; "
+                    f"Path('{sentinel_name}').write_text('ran')\""
+                )
+                task = self.temp.add_task(
+                    title=f"unknown context {number}", checks=[command]
+                )
+                context = {**CONTEXT, **extra}
+                context_path = self.temp.write_context(
+                    context, f"unknown-context-{number}.json"
+                )
+                with sqlite3.connect(str(database)) as connection:
+                    before_task = connection.execute(
+                        "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchone()
+                    before_registrations = connection.execute(
+                        "SELECT capsule_id FROM capsules WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchall()
+                before_directories = sorted(path.name for path in capsules.iterdir())
+
+                result = self.temp.run(
+                    "capture",
+                    "--task",
+                    task["task_id"],
+                    "--context",
+                    str(context_path),
+                    "--project",
+                    str(self.temp.project),
+                    "--json",
+                )
+
+                with sqlite3.connect(str(database)) as connection:
+                    after_task = connection.execute(
+                        "SELECT revision, current_capsule_id FROM tasks WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchone()
+                    after_registrations = connection.execute(
+                        "SELECT capsule_id FROM capsules WHERE task_id = ?",
+                        (task["task_id"],),
+                    ).fetchall()
+                after_directories = sorted(path.name for path in capsules.iterdir())
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout.count("\n"), 1)
+                envelope = self.temp.json_stdout(result)
+                self.assertFalse(envelope["ok"])
+                self.assertEqual(
+                    envelope["error"]["code"], "INVALID_CAPTURE_CONTEXT"
+                )
+                self.assertEqual(after_task, before_task)
+                self.assertEqual(after_registrations, before_registrations)
+                self.assertEqual(after_directories, before_directories)
+                self.assertFalse((self.temp.project / sentinel_name).exists())
+
+    def test_valid_context_is_projected_and_survives_capture_and_resume_exactly(self) -> None:
+        context = {
+            "summary": "仅保存交接摘要",
+            "agent_claims": ["声明一", "声明二"],
+            "unknowns": ["未知一"],
+            "open_loops": [
+                {
+                    "title": "待处理事项",
+                    "disposition": "resolve",
+                    "note": "下一次交接继续",
+                }
+            ],
+            "next_step": "执行下一步检查",
+        }
+        context_path = self.temp.write_context(context, "valid-context.json")
+        result = self.temp.run(
+            "capture",
+            "--task",
+            self.task["task_id"],
+            "--context",
+            str(context_path),
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        captured = self.temp.json_stdout(result)["data"]
+        capsule_id = captured["capsule"]["capsule_id"]
+        capsule_path = (
+            self.temp.project
+            / ".offwork"
+            / "capsules"
+            / capsule_id
+            / "capsule.json"
+        )
+        persisted = json.loads(capsule_path.read_text(encoding="utf-8"))["context"]
+        self.assertEqual(set(persisted), set(context))
+        self.assertEqual(persisted, context)
+
+        resumed_result = self.temp.run(
+            "resume",
+            "--task",
+            self.task["task_id"],
+            "--capsule",
+            capsule_id,
+            "--project",
+            str(self.temp.project),
+            "--json",
+        )
+
+        self.assertEqual(
+            resumed_result.returncode,
+            0,
+            resumed_result.stderr or resumed_result.stdout,
+        )
+        resumed = self.temp.json_stdout(resumed_result)["data"]
+        self.assertEqual(
+            {
+                "summary": resumed["agent_claimed"]["summary"],
+                "agent_claims": resumed["agent_claimed"]["items"],
+                "unknowns": resumed["unknowns"],
+                "open_loops": resumed["open_loops"],
+                "next_step": resumed["next_step"],
+            },
+            context,
+        )
+
     def test_unknown_task_does_not_publish_capsule(self) -> None:
         path = self.temp.write_context(CONTEXT)
         result = self.temp.run(

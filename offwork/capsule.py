@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -23,6 +24,14 @@ from offwork.state import (
 
 PAYLOAD_NAMES = ("capsule.json", "checks.json", "restore-test.json")
 CAPSULE_MEMBERS = frozenset((*PAYLOAD_NAMES, "manifest.json"))
+CAPTURE_CONTEXT_FIELDS = (
+    "summary",
+    "agent_claims",
+    "unknowns",
+    "open_loops",
+    "next_step",
+)
+CAPTURE_CONTEXT_FIELD_SET = frozenset(CAPTURE_CONTEXT_FIELDS)
 
 
 def _is_string_list(value: Any) -> bool:
@@ -32,6 +41,7 @@ def _is_string_list(value: Any) -> bool:
 def _has_fixed_v1_context_structure(value: Any) -> bool:
     return (
         isinstance(value, dict)
+        and set(value) == CAPTURE_CONTEXT_FIELD_SET
         and isinstance(value.get("summary"), str)
         and _is_string_list(value.get("agent_claims"))
         and _is_string_list(value.get("unknowns"))
@@ -227,6 +237,13 @@ def load_context(path: str) -> Dict[str, Any]:
         ) from exc
     if not isinstance(value, dict):
         raise OffworkError("INVALID_CAPTURE_CONTEXT", "Capture context must be an object")
+    unknown_fields = set(value) - CAPTURE_CONTEXT_FIELD_SET
+    if unknown_fields:
+        raise OffworkError(
+            "INVALID_CAPTURE_CONTEXT",
+            "Capture context contains unknown fields",
+            details={"fields": sorted(unknown_fields)},
+        )
     required_strings = ("summary", "next_step")
     required_lists = ("agent_claims", "unknowns", "open_loops")
     if any(not isinstance(value.get(name), str) or not value[name].strip() for name in required_strings):
@@ -244,7 +261,9 @@ def load_context(path: str) -> Dict[str, Any]:
             "INVALID_CAPTURE_CONTEXT",
             "Capture context contains invalid nested values",
         )
-    return value
+    return {
+        name: copy.deepcopy(value[name]) for name in CAPTURE_CONTEXT_FIELDS
+    }
 
 
 def capture(
